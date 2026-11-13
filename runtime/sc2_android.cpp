@@ -261,20 +261,39 @@ bool sc2_android_start_again(const std::vector<std::string> &args)
     jobject activity = static_cast<jobject>(SDL_GetAndroidActivity());
     if (!env || !activity) return false;
     jclass activity_class = env->GetObjectClass(activity);
-    jmethodID start_again = env->GetMethodID(activity_class, "startAgain", "([Ljava/lang/String;)Z");
+    jmethodID start_again = activity_class ? env->GetMethodID(activity_class, "startAgain", "([Ljava/lang/String;)Z") : nullptr;
     if (!start_again) {
-        env->ExceptionClear();
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (activity_class) env->DeleteLocalRef(activity_class);
+        env->DeleteLocalRef(activity);
         return false;
     }
     jclass string_class = env->FindClass("java/lang/String");
-    jobjectArray arguments = env->NewObjectArray(static_cast<jsize>(args.size()), string_class, nullptr);
+    jobjectArray arguments = string_class ? env->NewObjectArray(static_cast<jsize>(args.size()), string_class, nullptr) : nullptr;
+    if (!arguments) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (string_class) env->DeleteLocalRef(string_class);
+        env->DeleteLocalRef(activity_class);
+        env->DeleteLocalRef(activity);
+        return false;
+    }
     for (size_t i = 0; i < args.size(); i++) {
         jstring arg = env->NewStringUTF(args[i].c_str());
+        if (!arg) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->DeleteLocalRef(arguments);
+            env->DeleteLocalRef(string_class);
+            env->DeleteLocalRef(activity_class);
+            env->DeleteLocalRef(activity);
+            return false;
+        }
         env->SetObjectArrayElement(arguments, static_cast<jsize>(i), arg);
         env->DeleteLocalRef(arg);
     }
-    const bool started = env->CallBooleanMethod(activity, start_again, arguments);
+    const bool started = env->CallBooleanMethod(activity, start_again, arguments) != JNI_FALSE;
+    if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(arguments);
+    env->DeleteLocalRef(string_class);
     env->DeleteLocalRef(activity_class);
     env->DeleteLocalRef(activity);
     return started;
