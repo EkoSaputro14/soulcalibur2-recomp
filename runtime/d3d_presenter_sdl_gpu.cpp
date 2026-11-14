@@ -19,6 +19,9 @@
 #include "d3d_vblank.h"
 #include "input_keyboard_win32.h"
 #include "overlay_sdl_gpu.h"
+#include "sc2_dxt_decode.h"
+#include "sc2_perf_metrics.h"
+#include "sc2_texture_cache.h"
 #include "screenshot.h"
 
 #include <SDL3/SDL.h>
@@ -68,6 +71,24 @@ constexpr uint32_t kProgramFloats = 192u * 4u;
 constexpr uint32_t kTransformFloats = kRecompD3dDrawConstantFloats - kProgramFloats;
 constexpr uint32_t kInitialVertexCapacity = 32u * 1024u * 1024u;
 constexpr uint32_t kInitialIndexCapacity = 16u * 1024u * 1024u;
+constexpr uint32_t kInitialUploadTransferCapacity = 8u * 1024u * 1024u;
+
+std::atomic<uint64_t> g_perf_draw_ns{0u};
+std::atomic<uint64_t> g_perf_upload_ns{0u};
+std::atomic<uint64_t> g_perf_tex_decode_ns{0u};
+std::atomic<uint64_t> g_perf_flush_ns{0u};
+std::atomic<uint64_t> g_perf_present_wait_ns{0u};
+std::atomic<uint64_t> g_perf_present_total_ns{0u};
+std::atomic<uint32_t> g_perf_draws{0u};
+std::atomic<uint32_t> g_perf_uploads{0u};
+std::atomic<uint32_t> g_perf_dxt_decodes{0u};
+std::atomic<uint32_t> g_perf_flushes{0u};
+
+inline uint64_t steadyNowNs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 bool envFlag(const char *name)
 {
@@ -121,8 +142,35 @@ struct TextureEntry {
     uint32_t mip_levels = 0u;
     uint8_t palette[kPaletteBytes]{};
     uint64_t fingerprint = 0u;
+    uint64_t last_used = 0u;
+    uint64_t last_segment_id = 0u;
     SDL_GPUTexture *texture = nullptr;
 };
+
+struct TextureLookupRequest {
+    RecompD3dTextureDesc texture{};
+    const void *texture_bytes = nullptr;
+    uint32_t texture_byte_count = 0u;
+    const void *palette_bytes = nullptr;
+    uint32_t palette_byte_count = 0u;
+    bool bump_env = false;
+    bool texture_is_backbuffer = false;
+    bool texture_is_front_buffer = false;
+};
+
+inline TextureLookupRequest makeLookupRequest(const RecompD3dPresenterDrawCommand &draw)
+{
+    TextureLookupRequest req;
+    req.texture = draw.texture;
+    req.texture_bytes = draw.texture_bytes;
+    req.texture_byte_count = draw.texture_byte_count;
+    req.palette_bytes = draw.palette_bytes;
+    req.palette_byte_count = draw.palette_byte_count;
+    req.bump_env = draw.bump_env;
+    req.texture_is_backbuffer = draw.texture_is_backbuffer;
+    req.texture_is_front_buffer = draw.texture_is_front_buffer;
+    return req;
+}
 
 /* Rendered pixels have no CPU copy, so targets live until their guest
    storage is released. A multisampled target draws into render and samples
@@ -265,6 +313,11 @@ struct VisibilityQuery {
     SDL_GPUFence *fence = nullptr;
 };
 
+struct WideVertex {
+    float x, y, z, rhw;
+    uint32_t diffuse;
+};
+
 } // namespace
 
 struct RecompD3dPresenter {
@@ -303,10 +356,13 @@ struct RecompD3dPresenter {
     SDL_GPUBuffer *index_buffer = nullptr;
     SDL_GPUTransferBuffer *vertex_transfer = nullptr;
     SDL_GPUTransferBuffer *index_transfer = nullptr;
+    SDL_GPUTransferBuffer *upload_transfer = nullptr;
     uint32_t vertex_capacity = 0u, index_capacity = 0u;
     uint32_t vertex_used = 0u, index_used = 0u;
+    uint32_t upload_transfer_capacity = 0u, upload_transfer_used = 0u;
 
     Segment segment;
+    uint64_t segment_id = 1u;
     SDL_GPUCommandBuffer *command_buffer = nullptr;
 
     std::mutex shader_lock;
@@ -319,12 +375,23 @@ struct RecompD3dPresenter {
     std::atomic<bool> precompile_stop{false};
 
     std::vector<TextureEntry> textures = std::vector<TextureEntry>(kTextureSlots);
+    bool texture_used[kTextureSlots]{};
+    uint64_t texture_last_used[kTextureSlots]{};
     std::unordered_multimap<uint32_t, uint32_t> texture_index;
     uint32_t texture_count = 0u;
     uint32_t next_texture_slot = 0u;
     uint32_t texture_generation = 0u;   // (recomp_d3d_textures_generation when the textures were made)
+    uint64_t texture_use_clock = 0u;
     // Textures replaced while queued draws still bind them; released after the next flush.
     std::vector<SDL_GPUTexture *> retired_textures;
+
+    std::vector<uint8_t> scratch_decoded;
+    std::vector<uint8_t> scratch_unpacked;
+    std::vector<uint8_t> scratch_indices;
+    std::vector<uint8_t> scratch_white;
+    std::vector<uint16_t> scratch_expanded_indices;
+    std::vector<WideVertex> scratch_wide;
+    std::vector<WideVertex> scratch_line_strip;
 
     std::vector<RenderTargetEntry> render_targets;
     std::vector<DepthTargetEntry> depth_targets;
@@ -425,11 +492,17 @@ SDL_GPUCommandBuffer *commandBuffer(RecompD3dPresenter *presenter)
     return presenter->command_buffer;
 }
 
+void clearCommandBuffer(RecompD3dPresenter *presenter)
+{
+    presenter->command_buffer = nullptr;
+    presenter->upload_transfer_used = 0u;
+}
+
 void submitCommands(RecompD3dPresenter *presenter)
 {
     if (presenter->command_buffer != nullptr) {
         SDL_SubmitGPUCommandBuffer(presenter->command_buffer);
-        presenter->command_buffer = nullptr;
+        clearCommandBuffer(presenter);
     }
 }
 
@@ -497,7 +570,11 @@ void dropTextures(RecompD3dPresenter *presenter)
     for (TextureEntry &entry : presenter->textures) {
         if (entry.used) retireTexture(presenter, entry.texture);
         entry.used = false;
+        entry.last_used = 0u;
+        entry.last_segment_id = 0u;
     }
+    std::fill(std::begin(presenter->texture_used), std::end(presenter->texture_used), false);
+    std::fill(std::begin(presenter->texture_last_used), std::end(presenter->texture_last_used), 0u);
     presenter->texture_index.clear();
     presenter->texture_count = 0u;
     presenter->next_texture_slot = 0u;
@@ -755,29 +832,52 @@ bool isSwizzledTextureFormat(uint32_t format_byte)
         format_byte == RECOMP_D3D_TEXTURE_FORMAT_A8 || format_byte == 0x28u;
 }
 
-/* Uploads one region of bytes, rows packed at pixels_per_row texels. */
+/* Uploads one region of bytes, rows packed at pixels_per_row texels. Uses a persistent
+   ringed staging buffer so texture uploads avoid creating/destroying a transfer buffer per mip. */
 bool uploadTexture(RecompD3dPresenter *presenter, SDL_GPUTexture *texture, const void *bytes,
     uint32_t size, uint32_t level, uint32_t width, uint32_t height, uint32_t depth = 1u,
     uint32_t pixels_per_row = 0u)
 {
-    SDL_GPUTransferBufferCreateInfo info{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, size, 0};
-    SDL_GPUTransferBuffer *transfer = SDL_CreateGPUTransferBuffer(presenter->device, &info);
-    if (transfer == nullptr) return false;
-    void *mapped = SDL_MapGPUTransferBuffer(presenter->device, transfer, false);
-    if (mapped == nullptr) {
-        SDL_ReleaseGPUTransferBuffer(presenter->device, transfer);
-        return false;
+    if (size == 0u) return true;
+    const uint64_t t0 = steadyNowNs();
+    if (size > presenter->upload_transfer_capacity) {
+        submitCommands(presenter);
+        if (presenter->upload_transfer != nullptr) {
+            SDL_ReleaseGPUTransferBuffer(presenter->device, presenter->upload_transfer);
+            presenter->upload_transfer = nullptr;
+            presenter->upload_transfer_capacity = 0u;
+            presenter->upload_transfer_used = 0u;
+        }
+        const uint32_t padded = size > UINT32_MAX - 4095u ? size : ((size + 4095u) & ~4095u);
+        const uint32_t capacity = std::max(kInitialUploadTransferCapacity, padded);
+        SDL_GPUTransferBufferCreateInfo info{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, capacity, 0};
+        presenter->upload_transfer = SDL_CreateGPUTransferBuffer(presenter->device, &info);
+        if (presenter->upload_transfer == nullptr) return false;
+        presenter->upload_transfer_capacity = capacity;
+        presenter->upload_transfer_used = 0u;
     }
-    std::memcpy(mapped, bytes, size);
-    SDL_UnmapGPUTransferBuffer(presenter->device, transfer);
+
+    uint32_t offset = presenter->upload_transfer_used <= presenter->upload_transfer_capacity - 255u
+        ? ((presenter->upload_transfer_used + 255u) & ~255u)
+        : presenter->upload_transfer_capacity;
+    if (offset > presenter->upload_transfer_capacity || size > presenter->upload_transfer_capacity - offset) {
+        offset = 0u;
+    }
+    const bool cycle = (offset == 0u);
+    void *mapped = SDL_MapGPUTransferBuffer(presenter->device, presenter->upload_transfer, cycle);
+    if (mapped == nullptr) return false;
+    std::memcpy(static_cast<uint8_t *>(mapped) + offset, bytes, size);
+    SDL_UnmapGPUTransferBuffer(presenter->device, presenter->upload_transfer);
     SDL_GPUCopyPass *pass = SDL_BeginGPUCopyPass(commandBuffer(presenter));
     if (pass != nullptr) {
-        SDL_GPUTextureTransferInfo source{transfer, 0u, pixels_per_row, depth > 1u ? height : 0u};
+        SDL_GPUTextureTransferInfo source{presenter->upload_transfer, offset, pixels_per_row, depth > 1u ? height : 0u};
         SDL_GPUTextureRegion region{texture, level, 0u, 0u, 0u, 0u, width, height, depth};
         SDL_UploadToGPUTexture(pass, &source, &region, false);
         SDL_EndGPUCopyPass(pass);
+        presenter->upload_transfer_used = offset + size;
     }
-    SDL_ReleaseGPUTransferBuffer(presenter->device, transfer);
+    g_perf_upload_ns.fetch_add(steadyNowNs() - t0, std::memory_order_relaxed);
+    g_perf_uploads.fetch_add(1u, std::memory_order_relaxed);
     return pass != nullptr;
 }
 
@@ -924,80 +1024,6 @@ void countDrawTexture(const RecompD3dPresenterDrawCommand &draw, bool sampled)
     }
 }
 
-/* One mip level of DXT1, DXT3 or DXT5 decoded to BGRA bytes, for a GPU that cannot sample BC1-3. DXT1's
-   colour1 >= colour0 blocks have three colours and transparent black. */
-void decodeBlockLevel(const uint8_t *src, uint32_t width, uint32_t height, uint32_t format_byte,
-    std::vector<uint8_t> &out)
-{
-    out.assign(static_cast<size_t>(width) * height * 4u, 0u);
-    const bool dxt1 = format_byte == RECOMP_D3D_TEXTURE_FORMAT_DXT1;
-    const bool dxt3 = format_byte == RECOMP_D3D_TEXTURE_FORMAT_DXT3;
-    const uint32_t block_bytes = dxt1 ? 8u : 16u;
-    const uint32_t blocks_x = (width + 3u) / 4u, blocks_y = (height + 3u) / 4u;
-    const auto expand = [](uint16_t c, uint8_t rgb[3]) {
-        rgb[0] = static_cast<uint8_t>(((c >> 11) & 31u) * 255u / 31u);
-        rgb[1] = static_cast<uint8_t>(((c >> 5) & 63u) * 255u / 63u);
-        rgb[2] = static_cast<uint8_t>((c & 31u) * 255u / 31u);
-    };
-    for (uint32_t by = 0u; by < blocks_y; ++by) {
-        for (uint32_t bx = 0u; bx < blocks_x; ++bx) {
-            const uint8_t *block = src + (static_cast<size_t>(by) * blocks_x + bx) * block_bytes;
-            uint8_t alpha[16];
-            const uint8_t *colour = block;
-            if (dxt3) {
-                for (int i = 0; i < 16; ++i) {
-                    const uint8_t nibble = (block[i / 2] >> ((i & 1) * 4)) & 15u;
-                    alpha[i] = static_cast<uint8_t>(nibble * 17u);
-                }
-                colour = block + 8;
-            } else if (!dxt1) {
-                uint8_t a[8] = {block[0], block[1]};
-                if (a[0] > a[1]) {
-                    for (int i = 1; i < 7; ++i) a[i + 1] = static_cast<uint8_t>(((7 - i) * a[0] + i * a[1]) / 7);
-                } else {
-                    for (int i = 1; i < 5; ++i) a[i + 1] = static_cast<uint8_t>(((5 - i) * a[0] + i * a[1]) / 5);
-                    a[6] = 0u;
-                    a[7] = 255u;
-                }
-                uint64_t bits = 0u;
-                for (int i = 0; i < 6; ++i) bits |= static_cast<uint64_t>(block[2 + i]) << (8 * i);
-                for (int i = 0; i < 16; ++i) alpha[i] = a[(bits >> (3 * i)) & 7u];
-                colour = block + 8;
-            } else {
-                std::memset(alpha, 255, sizeof alpha);
-            }
-            const uint16_t c0 = static_cast<uint16_t>(colour[0] | colour[1] << 8);
-            const uint16_t c1 = static_cast<uint16_t>(colour[2] | colour[3] << 8);
-            uint8_t rgb[4][3];
-            expand(c0, rgb[0]);
-            expand(c1, rgb[1]);
-            bool transparent = false;
-            for (int k = 0; k < 3; ++k) {
-                if (!dxt1 || c0 > c1) {
-                    rgb[2][k] = static_cast<uint8_t>((2 * rgb[0][k] + rgb[1][k]) / 3);
-                    rgb[3][k] = static_cast<uint8_t>((rgb[0][k] + 2 * rgb[1][k]) / 3);
-                } else {
-                    rgb[2][k] = static_cast<uint8_t>((rgb[0][k] + rgb[1][k]) / 2);
-                    rgb[3][k] = 0u;
-                    transparent = true;
-                }
-            }
-            const uint32_t indices = static_cast<uint32_t>(colour[4] | colour[5] << 8 | colour[6] << 16) |
-                static_cast<uint32_t>(colour[7]) << 24;
-            for (int i = 0; i < 16; ++i) {
-                const uint32_t x = bx * 4u + (i & 3), y = by * 4u + (i >> 2);
-                if (x >= width || y >= height) continue;
-                const uint32_t index = (indices >> (2 * i)) & 3u;
-                uint8_t *texel = out.data() + (static_cast<size_t>(y) * width + x) * 4u;
-                texel[0] = rgb[index][2];
-                texel[1] = rgb[index][1];
-                texel[2] = rgb[index][0];
-                texel[3] = transparent && index == 3u ? 0u : alpha[i];
-            }
-        }
-    }
-}
-
 /* A texture pack's image for a guest texture (d3d_texture_replace.h), uploaded with its own levels: decoded to
    BGRA when the GPU cannot sample BC1-3. nullptr when there is none (or it cannot be made). */
 SDL_GPUTexture *replacementTexture(RecompD3dPresenter *presenter, uint64_t key)
@@ -1018,14 +1044,17 @@ SDL_GPUTexture *replacementTexture(RecompD3dPresenter *presenter, uint64_t key)
     const uint32_t block = format_byte == RECOMP_D3D_TEXTURE_FORMAT_DXT1 ? 8u : 16u;
     uint32_t width = replacement.width, height = replacement.height;
     size_t offset = 0u;
-    std::vector<uint8_t> decoded;
+    std::vector<uint8_t> &decoded = presenter->scratch_decoded;
     for (uint32_t level = 0u; level < replacement.levels; ++level) {
         const size_t size = compressed ? static_cast<size_t>((width + 3u) / 4u) * ((height + 3u) / 4u) * block
                                        : static_cast<size_t>(width) * height * 4u;
         const uint8_t *bytes = replacement.data + offset;
         bool uploaded;
         if (decode) {
-            decodeBlockLevel(bytes, width, height, format_byte, decoded);
+            const uint64_t dt0 = steadyNowNs();
+            sc2::decodeBlockLevelFast(bytes, width, height, format_byte, decoded);
+            g_perf_tex_decode_ns.fetch_add(steadyNowNs() - dt0, std::memory_order_relaxed);
+            g_perf_dxt_decodes.fetch_add(1u, std::memory_order_relaxed);
             uploaded = uploadTexture(presenter, texture, decoded.data(), static_cast<uint32_t>(decoded.size()),
                 level, width, height);
         } else {
@@ -1042,22 +1071,22 @@ SDL_GPUTexture *replacementTexture(RecompD3dPresenter *presenter, uint64_t key)
     return texture;
 }
 
-SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDrawCommand &draw)
+SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const TextureLookupRequest &req)
 {
     if (const uint32_t generation = recomp_d3d_textures_generation(); generation != presenter->texture_generation) {
         presenter->texture_generation = generation;
         dropTextures(presenter);
     }
-    const RecompD3dTextureDesc &desc = draw.texture;
+    const RecompD3dTextureDesc &desc = req.texture;
     const bool volume = desc.volume_depth != 0u;
     if (volume && (desc.linear || desc.depth || desc.format_byte != 6u ||
         desc.bits_per_pixel != 32u || desc.mip_levels > 1u ||
         desc.width == 0u || desc.height == 0u ||
         desc.width > kMaxVolumeSize || desc.height > kMaxVolumeSize || desc.volume_depth > kMaxVolumeSize ||
-        static_cast<uint64_t>(desc.width) * desc.height * desc.volume_depth * 4u > draw.texture_byte_count))
+        static_cast<uint64_t>(desc.width) * desc.height * desc.volume_depth * 4u > req.texture_byte_count))
         return nullptr;
     // Only the bump pass reads 0x28, with COLORSIGN; its unsigned uses stay unsampled.
-    if (desc.format_byte == 0x28u && !draw.bump_env) return nullptr;
+    if (desc.format_byte == 0x28u && !req.bump_env) return nullptr;
     const bool palettized = desc.format_byte == RECOMP_D3D_TEXTURE_FORMAT_P8;
     const bool linear_bgra = desc.format_byte == 0x12u;
     const bool compressed = desc.format_byte == RECOMP_D3D_TEXTURE_FORMAT_DXT1 ||
@@ -1065,12 +1094,12 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPres
     const uint32_t levels = compressed && desc.mip_levels ? desc.mip_levels : 1u;
     if (compressed) {
         const uint32_t span = recomp_d3d_texture_compressed_mip_span(&desc);
-        if (span == 0u || span > draw.texture_byte_count ||
+        if (span == 0u || span > req.texture_byte_count ||
             desc.width > kMaxTextureSize || desc.height > kMaxTextureSize) return nullptr;
     }
 
-    if (draw.texture_is_backbuffer) {
-        SDL_GPUTexture *texture = lookupBackBufferTexture(presenter, desc, draw.texture_is_front_buffer);
+    if (req.texture_is_backbuffer) {
+        SDL_GPUTexture *texture = lookupBackBufferTexture(presenter, desc, req.texture_is_front_buffer);
         static bool reported;
         if (texture == nullptr && !reported) {
             reported = true;
@@ -1079,7 +1108,7 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPres
         }
         return texture;
     }
-    if (palettized && (draw.palette_bytes == nullptr || draw.palette_byte_count != kPaletteBytes)) {
+    if (palettized && (req.palette_bytes == nullptr || req.palette_byte_count != kPaletteBytes)) {
         return nullptr;
     }
     if (RenderTargetEntry *entry = findRenderTarget(presenter, desc)) {
@@ -1094,20 +1123,21 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPres
     if (linear_bgra && (!desc.linear || desc.depth ||
         desc.bits_per_pixel != 32u || desc.width == 0u || desc.height == 0u ||
         desc.width > kMaxTextureSize || desc.height > kMaxTextureSize ||
-        desc.pitch < desc.width * 4u || draw.texture_bytes == nullptr ||
-        static_cast<uint64_t>(desc.height - 1u) * desc.pitch + desc.width * 4u > draw.texture_byte_count)) {
+        desc.pitch < desc.width * 4u || req.texture_bytes == nullptr ||
+        static_cast<uint64_t>(desc.height - 1u) * desc.pitch + desc.width * 4u > req.texture_byte_count)) {
         return nullptr;
     }
     const auto cached = presenter->texture_index.equal_range(desc.data);
-    const bool fingerprinted = !linear_bgra && draw.texture_bytes != nullptr;
+    const bool fingerprinted = !linear_bgra && req.texture_bytes != nullptr;
     const uint64_t fingerprint = fingerprinted
-        ? textureFingerprint(draw.texture_bytes, draw.texture_byte_count) : 0u;
+        ? textureFingerprint(req.texture_bytes, req.texture_byte_count) : 0u;
     for (auto it = cached.first; it != cached.second; ++it) {
-        TextureEntry &entry = presenter->textures[it->second];
+        const uint32_t slot = it->second;
+        TextureEntry &entry = presenter->textures[slot];
         if (entry.format_byte == desc.format_byte && entry.width == desc.width &&
             entry.height == desc.height && entry.volume_depth == desc.volume_depth &&
             entry.mip_levels == levels &&
-            (!palettized || std::memcmp(entry.palette, draw.palette_bytes, kPaletteBytes) == 0)) {
+            (!palettized || std::memcmp(entry.palette, req.palette_bytes, kPaletteBytes) == 0)) {
             if (fingerprinted && entry.fingerprint != fingerprint) {
                 static unsigned reported;
                 if (reported < 32u) {
@@ -1115,81 +1145,116 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPres
                     std::fprintf(stderr, "recomp d3d presenter: texels changed data=0x%08X "
                         "fmt=0x%02X size=%ux%u\n", desc.data, desc.format_byte, desc.width, desc.height);
                 }
-                unindexTexture(presenter, it->second);
+                unindexTexture(presenter, slot);
                 retireTexture(presenter, entry.texture);
                 entry.used = false;
+                entry.last_used = 0u;
+                presenter->texture_used[slot] = false;
+                presenter->texture_last_used[slot] = 0u;
                 break;
             }
             if (linear_bgra) {
-                // Queued draws sampled the old pixels; record them before this upload.
-                flushSegment(presenter);
-                std::vector<uint8_t> packed(static_cast<size_t>(desc.width) * desc.height * 4u);
-                for (uint32_t y = 0u; y < desc.height; ++y) {
-                    std::memcpy(packed.data() + static_cast<size_t>(y) * desc.width * 4u,
-                        static_cast<const uint8_t *>(draw.texture_bytes) + static_cast<size_t>(y) * desc.pitch,
-                        desc.width * 4u);
+                // Only flush if an already-queued draw in THIS segment sampled this texture.
+                if (sc2::ShouldFlushLinearBgraUpdate(entry.last_segment_id, presenter->segment_id,
+                        !presenter->segment.draws.empty())) {
+                    flushSegment(presenter);
                 }
-                uploadTexture(presenter, entry.texture, packed.data(),
-                    static_cast<uint32_t>(packed.size()), 0u, desc.width, desc.height);
+                const uint32_t row_bytes = desc.width * 4u;
+                const uint32_t upload_size = row_bytes * desc.height;
+                const void *upload_bytes = req.texture_bytes;
+                if (desc.pitch != row_bytes) {
+                    std::vector<uint8_t> &packed = presenter->scratch_unpacked;
+                    packed.resize(upload_size);
+                    for (uint32_t y = 0u; y < desc.height; ++y) {
+                        std::memcpy(packed.data() + static_cast<size_t>(y) * row_bytes,
+                            static_cast<const uint8_t *>(req.texture_bytes) + static_cast<size_t>(y) * desc.pitch,
+                            row_bytes);
+                    }
+                    upload_bytes = packed.data();
+                }
+                uploadTexture(presenter, entry.texture, upload_bytes, upload_size, 0u, desc.width, desc.height);
             }
+            entry.last_used = ++presenter->texture_use_clock;
+            entry.last_segment_id = presenter->segment_id;
+            presenter->texture_last_used[slot] = entry.last_used;
             return entry.texture;
         }
     }
     /* A texture pack's image in its place, or this one dumped for making one (d3d_texture_replace.h) */
     SDL_GPUTexture *replaced = nullptr;
-    if (!volume && !linear_bgra && draw.texture_bytes != nullptr && recomp_d3d_textures_active()) {
-        const void *palette = palettized ? draw.palette_bytes : nullptr;
-        const uint64_t key = recomp_d3d_texture_key(&desc, draw.texture_bytes, draw.texture_byte_count, palette);
-        recomp_d3d_texture_dump(key, &desc, draw.texture_bytes, draw.texture_byte_count, palette);
+    if (!volume && !linear_bgra && req.texture_bytes != nullptr && recomp_d3d_textures_active()) {
+        const void *palette = palettized ? req.palette_bytes : nullptr;
+        const uint64_t key = recomp_d3d_texture_key(&desc, req.texture_bytes, req.texture_byte_count, palette);
+        recomp_d3d_texture_dump(key, &desc, req.texture_bytes, req.texture_byte_count, palette);
         replaced = replacementTexture(presenter, key);
     }
     const bool decode_blocks = compressed && !presenter->block_compressed;
     const SDL_GPUTextureFormat format = volume ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM
         : linear_bgra || decode_blocks ? SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM : hostTextureFormat(desc.format_byte);
-    if (replaced == nullptr && (format == SDL_GPU_TEXTUREFORMAT_INVALID || draw.texture_bytes == nullptr ||
-        draw.texture_byte_count == 0u || (desc.linear && !linear_bgra))) {
+    if (replaced == nullptr && (format == SDL_GPU_TEXTUREFORMAT_INVALID || req.texture_bytes == nullptr ||
+        req.texture_byte_count == 0u || (desc.linear && !linear_bgra))) {
         return nullptr;
     }
     SDL_GPUTexture *texture = replaced;
     if (texture == nullptr) {
-        std::vector<uint8_t> unpacked;
+        std::vector<uint8_t> &unpacked = presenter->scratch_unpacked;
+        const void *upload_bytes = nullptr;
+        uint32_t upload_size = 0u;
         if (volume) {
             unpacked.resize(static_cast<size_t>(desc.width) * desc.height * desc.volume_depth * 4u);
-            if (!recomp_d3d_texture_unswizzle_volume(static_cast<const uint8_t *>(draw.texture_bytes),
+            if (!recomp_d3d_texture_unswizzle_volume(static_cast<const uint8_t *>(req.texture_bytes),
                     unpacked.data(), desc.width, desc.height, desc.volume_depth, 4u)) return nullptr;
             /* RGBA8 is supported for native 3D textures; guest words are BGRA. */
             for (size_t i = 0u; i < unpacked.size(); i += 4u) std::swap(unpacked[i], unpacked[i + 2u]);
+            upload_bytes = unpacked.data();
+            upload_size = static_cast<uint32_t>(unpacked.size());
         } else if (linear_bgra) {
-            unpacked.resize(static_cast<size_t>(desc.width) * desc.height * 4u);
-            for (uint32_t y = 0u; y < desc.height; ++y) {
-                std::memcpy(unpacked.data() + static_cast<size_t>(y) * desc.width * 4u,
-                    static_cast<const uint8_t *>(draw.texture_bytes) + static_cast<size_t>(y) * desc.pitch,
-                    desc.width * 4u);
+            const uint32_t row_bytes = desc.width * 4u;
+            upload_size = row_bytes * desc.height;
+            if (desc.pitch == row_bytes) {
+                upload_bytes = req.texture_bytes;
+            } else {
+                unpacked.resize(upload_size);
+                for (uint32_t y = 0u; y < desc.height; ++y) {
+                    std::memcpy(unpacked.data() + static_cast<size_t>(y) * row_bytes,
+                        static_cast<const uint8_t *>(req.texture_bytes) + static_cast<size_t>(y) * desc.pitch,
+                        row_bytes);
+                }
+                upload_bytes = unpacked.data();
             }
         } else if (palettized) {
             const size_t texels = static_cast<size_t>(desc.width) * desc.height;
             if (desc.width == 0u || desc.height == 0u || desc.width > kMaxTextureSize ||
-                desc.height > kMaxTextureSize || texels > draw.texture_byte_count) return nullptr;
-            std::vector<uint8_t> indices(texels);
-            if (!recomp_d3d_texture_unswizzle(static_cast<const uint8_t *>(draw.texture_bytes),
+                desc.height > kMaxTextureSize || texels > req.texture_byte_count) return nullptr;
+            std::vector<uint8_t> &indices = presenter->scratch_indices;
+            indices.resize(texels);
+            if (!recomp_d3d_texture_unswizzle(static_cast<const uint8_t *>(req.texture_bytes),
                     indices.data(), desc.width, desc.height, 1u)) return nullptr;
             unpacked.resize(texels * 4u);
-            const auto *palette = static_cast<const uint8_t *>(draw.palette_bytes);
+            const auto *palette = static_cast<const uint8_t *>(req.palette_bytes);
             for (size_t i = 0u; i < texels; ++i) {
                 /* Little-endian ARGB palette words are already BGRA bytes. */
                 std::memcpy(unpacked.data() + i * 4u, palette + indices[i] * 4u, 4u);
             }
+            upload_bytes = unpacked.data();
+            upload_size = static_cast<uint32_t>(unpacked.size());
         } else if (isSwizzledTextureFormat(desc.format_byte)) {
             const uint32_t texel_bytes = desc.bits_per_pixel / 8u;
             if (texel_bytes == 0u || desc.width == 0u || desc.height == 0u ||
                 desc.width > kMaxTextureSize || desc.height > kMaxTextureSize) return nullptr;
             unpacked.resize(static_cast<size_t>(desc.width) * desc.height * texel_bytes);
-            if (!recomp_d3d_texture_unswizzle(static_cast<const uint8_t *>(draw.texture_bytes),
+            if (!recomp_d3d_texture_unswizzle(static_cast<const uint8_t *>(req.texture_bytes),
                     unpacked.data(), desc.width, desc.height, texel_bytes)) return nullptr;
             if (desc.format_byte == RECOMP_D3D_TEXTURE_FORMAT_A8) {
-                std::vector<uint8_t> white(unpacked.size() * 4u, 0xffu);
+                std::vector<uint8_t> &white = presenter->scratch_white;
+                white.resize(unpacked.size() * 4u);
+                std::memset(white.data(), 0xff, white.size());
                 for (size_t i = 0u; i < unpacked.size(); ++i) white[i * 4u + 3u] = unpacked[i];
-                unpacked.swap(white);
+                upload_bytes = white.data();
+                upload_size = static_cast<uint32_t>(white.size());
+            } else {
+                upload_bytes = unpacked.data();
+                upload_size = static_cast<uint32_t>(unpacked.size());
             }
         }
 
@@ -1201,12 +1266,15 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPres
         if (compressed) {
             const uint32_t block_bytes = desc.format_byte == RECOMP_D3D_TEXTURE_FORMAT_DXT1 ? 8u : 16u;
             uint32_t width = desc.width, height = desc.height, offset = 0u;
-            std::vector<uint8_t> decoded;
+            std::vector<uint8_t> &decoded = presenter->scratch_decoded;
             for (uint32_t level = 0u; level < levels && uploaded; ++level) {
                 const uint32_t size = ((width + 3u) / 4u) * block_bytes * ((height + 3u) / 4u);
-                const uint8_t *blocks = static_cast<const uint8_t *>(draw.texture_bytes) + offset;
+                const uint8_t *blocks = static_cast<const uint8_t *>(req.texture_bytes) + offset;
                 if (decode_blocks) {
-                    decodeBlockLevel(blocks, width, height, desc.format_byte, decoded);
+                    const uint64_t dt0 = steadyNowNs();
+                    sc2::decodeBlockLevelFast(blocks, width, height, desc.format_byte, decoded);
+                    g_perf_tex_decode_ns.fetch_add(steadyNowNs() - dt0, std::memory_order_relaxed);
+                    g_perf_dxt_decodes.fetch_add(1u, std::memory_order_relaxed);
                     uploaded = uploadTexture(presenter, texture, decoded.data(), static_cast<uint32_t>(decoded.size()),
                         level, width, height);
                 } else {
@@ -1217,7 +1285,7 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPres
                 height = height > 1u ? height / 2u : 1u;
             }
         } else {
-            uploaded = uploadTexture(presenter, texture, unpacked.data(), static_cast<uint32_t>(unpacked.size()),
+            uploaded = uploadTexture(presenter, texture, upload_bytes, upload_size,
                 0u, desc.width, desc.height, volume ? desc.volume_depth : 1u);
         }
         if (!uploaded) {
@@ -1226,13 +1294,12 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPres
         }
     }
 
-    // ponytail: FIFO eviction; track recent use if upload churn is costly.
-    const uint32_t slot = presenter->next_texture_slot;
+    const uint32_t slot = sc2::SelectTextureEvictionSlot(
+        presenter->texture_last_used, presenter->texture_used, kTextureSlots, presenter->next_texture_slot);
     TextureEntry &entry = presenter->textures[slot];
     if (entry.used) unindexTexture(presenter, slot);
     retireTexture(presenter, entry.texture);
-    presenter->next_texture_slot = (presenter->next_texture_slot + 1u) % kTextureSlots;
-    if (presenter->texture_count < kTextureSlots) ++presenter->texture_count;
+    if (!presenter->texture_used[slot] && presenter->texture_count < kTextureSlots) ++presenter->texture_count;
     entry.used = true;
     entry.data = desc.data;
     entry.format_byte = desc.format_byte;
@@ -1240,9 +1307,13 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const RecompD3dPres
     entry.height = desc.height;
     entry.volume_depth = desc.volume_depth;
     entry.mip_levels = levels;
-    if (palettized) std::memcpy(entry.palette, draw.palette_bytes, kPaletteBytes);
+    if (palettized) std::memcpy(entry.palette, req.palette_bytes, kPaletteBytes);
     entry.fingerprint = fingerprint;
+    entry.last_used = ++presenter->texture_use_clock;
+    entry.last_segment_id = presenter->segment_id;
     entry.texture = texture;
+    presenter->texture_used[slot] = true;
+    presenter->texture_last_used[slot] = entry.last_used;
     presenter->texture_index.emplace(desc.data, slot);
     return texture;
 }
@@ -1899,6 +1970,7 @@ void flushSegment(RecompD3dPresenter *presenter)
         releaseRetiredTextures(presenter);
         return;
     }
+    const uint64_t t0 = steadyNowNs();
     const uint32_t vertex_bytes = static_cast<uint32_t>(segment.vertex_data.size());
     const uint32_t index_bytes = static_cast<uint32_t>(segment.index_data.size());
     bool ready = ensureRingCapacity(presenter, presenter->vertex_buffer, presenter->vertex_transfer,
@@ -2004,7 +2076,10 @@ void flushSegment(RecompD3dPresenter *presenter)
     segment.vertex_data.clear();
     segment.index_data.clear();
     segment.uniform_data.clear();
+    ++presenter->segment_id;
     releaseRetiredTextures(presenter);
+    g_perf_flush_ns.fetch_add(steadyNowNs() - t0, std::memory_order_relaxed);
+    g_perf_flushes.fetch_add(1u, std::memory_order_relaxed);
 }
 
 /* Switches the segment to a target, flushing draws queued for another. */
@@ -2151,16 +2226,20 @@ void queueDraw(RecompD3dPresenter *presenter, SDL_GPUGraphicsPipeline *pipeline,
     queued.index_count = index_count;
     /* The Transform buffer is the draw constants without vc[], which goes to
        the vertex stage's second buffer; consecutive draws often repeat both. */
-    float transform[kTransformFloats];
-    std::memcpy(transform, constants, 140u * sizeof(float));
-    std::memcpy(transform + 140u, constants + 140u + kProgramFloats, (kTransformFloats - 140u) * sizeof(float));
     std::vector<float> &uniforms = segment.uniform_data;
+    const float *tail_src = constants + 140u + kProgramFloats;
+    const size_t head_bytes = 140u * sizeof(float);
+    const size_t tail_floats = kTransformFloats - 140u;
+    const size_t tail_bytes = tail_floats * sizeof(float);
     if (!segment.draws.empty() && segment.draws.back().uniform_offset + kTransformFloats <= uniforms.size() &&
-        std::memcmp(uniforms.data() + segment.draws.back().uniform_offset, transform, sizeof transform) == 0) {
+        std::memcmp(uniforms.data() + segment.draws.back().uniform_offset, constants, head_bytes) == 0 &&
+        std::memcmp(uniforms.data() + segment.draws.back().uniform_offset + 140u, tail_src, tail_bytes) == 0) {
         queued.uniform_offset = segment.draws.back().uniform_offset;
     } else {
         queued.uniform_offset = static_cast<uint32_t>(uniforms.size());
-        uniforms.insert(uniforms.end(), transform, transform + kTransformFloats);
+        uniforms.resize(queued.uniform_offset + kTransformFloats);
+        std::memcpy(uniforms.data() + queued.uniform_offset, constants, head_bytes);
+        std::memcpy(uniforms.data() + queued.uniform_offset + 140u, tail_src, tail_bytes);
     }
     if (program) {
         const float *vc = constants + 140u;
@@ -2192,11 +2271,6 @@ struct LineVertex {
     float color[4];
 };
 
-struct WideVertex {
-    float x, y, z, rhw;
-    uint32_t diffuse;
-};
-
 uint32_t packColor(const float (&color)[4])
 {
     const auto byte = [](float value) {
@@ -2206,7 +2280,8 @@ uint32_t packColor(const float (&color)[4])
     return byte(color[2]) | byte(color[1]) << 8u | byte(color[0]) << 16u | byte(color[3]) << 24u;
 }
 
-void expandLine(LineVertex a, LineVertex b, const float *style, std::vector<WideVertex> &out)
+void expandLine(LineVertex a, LineVertex b, const float *style, std::vector<WideVertex> &out,
+    std::vector<WideVertex> &strip)
 {
     if (style[0] <= 0.0f) return;
     for (unsigned plane = 0u; plane < 3u; ++plane) {
@@ -2241,7 +2316,7 @@ void expandLine(LineVertex a, LineVertex b, const float *style, std::vector<Wide
         side[1] = 0.0f;
     }
     const unsigned layers = style[1] > 0.0f ? 4u : 2u;
-    std::vector<WideVertex> strip;
+    strip.clear();
     for (unsigned i = 0u; i < layers; ++i) {
         const float offset = style[1] > 0.0f
             ? (i == 0u ? -(style[0] + 1.0f) * 0.5f : i == 1u ? -std::fabs(style[0] - 1.0f) * 0.5f
@@ -2361,7 +2436,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     }
     useTarget(presenter, bound.color, bound.depth);
 
-    SDL_GPUTexture *texture = draw.has_texture ? lookupTexture(presenter, draw) : nullptr;
+    SDL_GPUTexture *texture = draw.has_texture ? lookupTexture(presenter, makeLookupRequest(draw)) : nullptr;
     /* A general pixel program samples its stage textures, in slots 0 to 2. */
     SDL_GPUTexture *stage_texture[3]{};
     if (general) {
@@ -2371,7 +2446,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
                 !draw.pixel_program.stages[i].sampled) continue;
             const auto &stage = draw.stage_textures[i];
             if (stage.white) continue;
-            RecompD3dPresenterDrawCommand lookup{};
+            TextureLookupRequest lookup;
             lookup.texture = stage.desc;
             lookup.texture_bytes = stage.bytes;
             lookup.texture_byte_count = stage.byte_count;
@@ -2391,7 +2466,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     SDL_GPUTexture *mask = nullptr, *bump = nullptr;
     if (draw.has_alpha_mask) {
         if (layout.texcoord_count != 2u) return unsupportedDraw(__LINE__);
-        RecompD3dPresenterDrawCommand lookup{};
+        TextureLookupRequest lookup;
         lookup.texture = draw.alpha_mask;
         lookup.texture_bytes = draw.alpha_mask_bytes;
         lookup.texture_byte_count = draw.alpha_mask_byte_count;
@@ -2402,7 +2477,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     }
     const auto reflectionLookup = [&](const RecompD3dTextureDesc &desc, const void *bytes, uint32_t count,
                                       bool bump_env = false) {
-        RecompD3dPresenterDrawCommand lookup{};
+        TextureLookupRequest lookup;
         lookup.bump_env = bump_env;
         lookup.texture = desc;
         lookup.texture_bytes = bytes;
@@ -2476,8 +2551,10 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     const void *vertices = draw.vertex_bytes;
     uint32_t vertex_bytes = draw.vertex_stride * draw.vertex_count;
     uint32_t stride = draw.vertex_stride;
-    std::vector<uint16_t> expanded_indices;
-    std::vector<WideVertex> wide;
+    std::vector<uint16_t> &expanded_indices = presenter->scratch_expanded_indices;
+    std::vector<WideVertex> &wide = presenter->scratch_wide;
+    expanded_indices.clear();
+    wide.clear();
     const void *indices = draw.index_bytes;
     uint32_t index_count = draw.index_count;
     if (draw.primitive_type == 7u) {
@@ -2516,7 +2593,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
             if (!fetch(source_indices[i], a) || !fetch(source_indices[i + 1u], b)) {
                 return unsupportedDraw(__LINE__);
             }
-            expandLine(a, b, style, wide);
+            expandLine(a, b, style, wide, presenter->scratch_line_strip);
         }
         if (wide.empty() || wide.size() > 65535u) return wide.empty() ? RECOMP_D3D_PRESENTER_OK
             : RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
@@ -2716,7 +2793,7 @@ RecompD3dPresenterError endVisibility(RecompD3dPresenter *presenter, uint32_t in
         /* The result is polled next frame; submitting now, as the SDK's push
            buffer kick does, lets the GPU finish it meanwhile. */
         query.fence = SDL_SubmitGPUCommandBufferAndAcquireFence(commands);
-        presenter->command_buffer = nullptr;
+        clearCommandBuffer(presenter);
         if (query.fence == nullptr) {
             releaseQuery(presenter, query);
             return RECOMP_D3D_PRESENTER_HOST_FAILURE;
@@ -2926,7 +3003,7 @@ void dumpTexture(RecompD3dPresenter *presenter, SDL_GPUTexture *texture, uint32_
         SDL_EndGPUCopyPass(pass);
     }
     SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(commands);
-    presenter->command_buffer = nullptr;
+    clearCommandBuffer(presenter);
     if (fence != nullptr) {
         SDL_WaitForGPUFences(presenter->device, true, &fence, 1u);
         SDL_ReleaseGPUFence(presenter->device, fence);
@@ -2961,7 +3038,7 @@ void saveScreenshot(RecompD3dPresenter *presenter, SDL_GPUTexture *frame)
             SDL_EndGPUCopyPass(pass);
         }
         SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(commands);
-        presenter->command_buffer = nullptr;
+        clearCommandBuffer(presenter);
         if (fence != nullptr) {
             SDL_WaitForGPUFences(presenter->device, true, &fence, 1u);
             SDL_ReleaseGPUFence(presenter->device, fence);
@@ -3261,6 +3338,7 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
     if (present.effective_flags != 5u || present.swap_counter == 0u) {
         return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
     }
+    const uint64_t present_t0 = steadyNowNs();
     pumpEvents(presenter);
     if (presenter->close_requested) return RECOMP_D3D_PRESENTER_CLOSED;
     flushSegment(presenter);
@@ -3302,8 +3380,11 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
         uint32_t width, height;
         const char *path;
     } shaded_shot{};
-    if (SDL_WaitAndAcquireGPUSwapchainTexture(commands, presenter->window, &swapchain, &swap_width, &swap_height) &&
-        swapchain != nullptr && swap_width != 0u && swap_height != 0u) {
+    const uint64_t wait_t0 = steadyNowNs();
+    const bool acquired = SDL_WaitAndAcquireGPUSwapchainTexture(
+        commands, presenter->window, &swapchain, &swap_width, &swap_height);
+    g_perf_present_wait_ns.fetch_add(steadyNowNs() - wait_t0, std::memory_order_relaxed);
+    if (acquired && swapchain != nullptr && swap_width != 0u && swap_height != 0u) {
         // The window keeps the guest aspect; the rest of the swapchain is black.
         const float source_aspect = static_cast<float>(presentClientWidth(presenter, mainHeight(presenter))) /
             mainHeight(presenter);
@@ -3391,7 +3472,7 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
     // On a display at a multiple of 60 Hz, the frame's end steers the game's clock (d3d_display_phase).
     recomp_display_phase_follow(presenter->window);
     if (presenter->command_buffer != nullptr &&
-        recomp_display_phase_submit(presenter->device, presenter->command_buffer)) presenter->command_buffer = nullptr;
+        recomp_display_phase_submit(presenter->device, presenter->command_buffer)) clearCommandBuffer(presenter);
     submitCommands(presenter);
     ++presenter->present_count;
     /* RECOMP_D3D_DRAW_LOG_AT=N starts the log at present N too (headless runs). */
@@ -3404,6 +3485,7 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
         std::fprintf(stderr, "recomp draw log: begin present=%u\n", presenter->present_count + 1u);
     }
     if (presenter->performance_counter) reportPerformance(presenter);
+    g_perf_present_total_ns.fetch_add(steadyNowNs() - present_t0, std::memory_order_relaxed);
     return RECOMP_D3D_PRESENTER_OK;
 }
 
@@ -3502,7 +3584,8 @@ void releasePresenter(RecompD3dPresenter *presenter)
     for (SDL_GPUBuffer *buffer : {presenter->vertex_buffer, presenter->index_buffer}) {
         if (buffer != nullptr) SDL_ReleaseGPUBuffer(presenter->device, buffer);
     }
-    for (SDL_GPUTransferBuffer *buffer : {presenter->vertex_transfer, presenter->index_transfer}) {
+    for (SDL_GPUTransferBuffer *buffer : {presenter->vertex_transfer, presenter->index_transfer,
+            presenter->upload_transfer}) {
         if (buffer != nullptr) SDL_ReleaseGPUTransferBuffer(presenter->device, buffer);
     }
     if (presenter->window != nullptr) {
@@ -3560,6 +3643,10 @@ bool createResources(RecompD3dPresenter *presenter)
         SDL_GPU_FILTER_NEAREST);
     if (presenter->draw_sampler == nullptr || presenter->filter_sampler == nullptr ||
         presenter->program_mask_sampler == nullptr || presenter->point_sampler == nullptr) return false;
+    presenter->segment.draws.reserve(512u);
+    presenter->segment.vertex_data.reserve(262144u);
+    presenter->segment.index_data.reserve(65536u);
+    presenter->segment.uniform_data.reserve(65536u);
     return ensureRingCapacity(presenter, presenter->vertex_buffer, presenter->vertex_transfer,
             presenter->vertex_capacity, presenter->vertex_used, 0u, SDL_GPU_BUFFERUSAGE_VERTEX) &&
         ensureRingCapacity(presenter, presenter->index_buffer, presenter->index_transfer,
@@ -3726,11 +3813,13 @@ RecompD3dPresenterError d3d_backend_submit(RecompD3dPresenter *presenter, const 
     case RECOMP_D3D_PRESENTER_COMMAND_PRESENT:
         return submitPresent(presenter, command->data.present);
     case RECOMP_D3D_PRESENTER_COMMAND_DRAW: {
-        const auto start = std::chrono::steady_clock::now();
+        const uint64_t t0 = steadyNowNs();
         const auto error = submitDraw(presenter, command->data.draw);
+        const uint64_t elapsed_ns = steadyNowNs() - t0;
+        g_perf_draw_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+        g_perf_draws.fetch_add(1u, std::memory_order_relaxed);
         if (presenter->draw_log_active) {
-            logDraw(presenter, command->data.draw, error, std::chrono::duration<double, std::micro>(
-                std::chrono::steady_clock::now() - start).count());
+            logDraw(presenter, command->data.draw, error, static_cast<double>(elapsed_ns) / 1000.0);
         }
         return error;
     }
@@ -3927,12 +4016,15 @@ RecompD3dPresenterError d3d_backend_release_memory(
         entry = presenter->depth_targets.back();
         presenter->depth_targets.pop_back();
     }
-    for (uint32_t i = 0u; i < presenter->texture_count; ++i) {
+    for (uint32_t i = 0u; i < kTextureSlots; ++i) {
         TextureEntry &entry = presenter->textures[i];
         if (entry.used && released(entry.data)) {
             unindexTexture(presenter, i);
             retireTexture(presenter, entry.texture);
             entry.used = false;
+            entry.last_used = 0u;
+            presenter->texture_used[i] = false;
+            presenter->texture_last_used[i] = 0u;
         }
     }
     // The segment no longer names a released target.
@@ -4023,7 +4115,7 @@ RecompD3dPresenterError d3d_backend_read_frame(RecompD3dPresenter *presenter,
         SDL_EndGPUCopyPass(pass);
     }
     SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(commands);
-    presenter->command_buffer = nullptr;
+    clearCommandBuffer(presenter);
     bool read = false;
     if (fence != nullptr) {
         SDL_WaitForGPUFences(presenter->device, true, &fence, 1u);
@@ -4126,4 +4218,19 @@ void d3d_backend_report_draw_textures()
     }
     std::fprintf(stderr, "recomp d3d presenter: draw texture untextured=%u cached=%u\n",
         draw_texture_tally.untextured, active_presenter != nullptr ? active_presenter->texture_count : 0u);
+}
+
+extern "C" void recomp_d3d_presenter_take_perf(RecompD3dPresenterPerf *out)
+{
+    if (out == nullptr) return;
+    out->draw_ns = g_perf_draw_ns.exchange(0u, std::memory_order_relaxed);
+    out->upload_ns = g_perf_upload_ns.exchange(0u, std::memory_order_relaxed);
+    out->tex_decode_ns = g_perf_tex_decode_ns.exchange(0u, std::memory_order_relaxed);
+    out->flush_ns = g_perf_flush_ns.exchange(0u, std::memory_order_relaxed);
+    out->present_wait_ns = g_perf_present_wait_ns.exchange(0u, std::memory_order_relaxed);
+    out->present_total_ns = g_perf_present_total_ns.exchange(0u, std::memory_order_relaxed);
+    out->draws = g_perf_draws.exchange(0u, std::memory_order_relaxed);
+    out->uploads = g_perf_uploads.exchange(0u, std::memory_order_relaxed);
+    out->dxt_decodes = g_perf_dxt_decodes.exchange(0u, std::memory_order_relaxed);
+    out->flushes = g_perf_flushes.exchange(0u, std::memory_order_relaxed);
 }

@@ -22,6 +22,7 @@ name, which replaces it. Each replacement is game-specific:
 | `d3d8_draw_adapter.c` | DOA2U's draw path translated the same way, plus SC2's push blocks (BeginPush/EndPush decoded, inline arrays drawn) and its new entry points; fixed-function draws go to the general pixel program |
 | `input_adapter.c` | DOA2U's XInput at SC2's addresses; SC2 polls XGetDevices |
 | `overlay_text.c`, `overlay_imgui_panel.cpp` | The shared overlay text plus SC2's training panels (`sc2_panel.h`: the input display and combo readout down each side, a note); drawn while either has something, laid out for SC2's life bars |
+| `d3d_texture_model.c` | Precomputes X Morton offsets once per unswizzle call and specializes texel widths to speed up mobile CPU texture uploads |
 | `sc2_hooks.c` (new, `RECOMP_GAME_SOURCES`) | Hooks that wrap a converted game function and run it; left out of `--manual-functions` so the original stays |
 
 ## The runtime maintainer's rules

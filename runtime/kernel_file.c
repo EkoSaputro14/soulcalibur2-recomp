@@ -26,6 +26,16 @@ static const uint32_t RECOMP_STATUS_OBJECT_NAME_NOT_FOUND = 0xc0000034u;
 static const uint32_t RECOMP_STATUS_NO_MEMORY = 0xc0000017u;
 static const uint32_t RECOMP_STATUS_DELETE_PENDING = 0xc0000056u;
 
+static bool verbose_io_log(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("RECOMP_VERBOSE_IO_LOG");
+        enabled = (value != NULL && strcmp(value, "1") == 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 enum {
     MAX_FILE_HANDLES = 256,
     MAX_PATH_LEN = 512,
@@ -1388,14 +1398,16 @@ static void bridge_nt_open_file(void)
         recomp_save_note_failure(save_owner);
     }
 
-    fprintf(
-        stderr,
-        "recomp kernel: NtOpenFile path='%s' host='%s' policy='%s' handle=%u status=0x%08x\n",
-        guest_path,
-        host_path,
-        policy,
-        (unsigned)guest_handle,
-        (unsigned)status);
+    if (verbose_io_log() || status != RECOMP_STATUS_SUCCESS) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtOpenFile path='%s' host='%s' policy='%s' handle=%u status=0x%08x\n",
+            guest_path,
+            host_path,
+            policy,
+            (unsigned)guest_handle,
+            (unsigned)status);
+    }
 
     if (file_handle_ptr != 0u) {
         *recomp_memory_u32(file_handle_ptr) = guest_handle;
@@ -1575,18 +1587,20 @@ static void bridge_nt_create_file(void)
         recomp_save_note_failure(save_owner);
     }
 
-    fprintf(
-        stderr,
-        "recomp kernel: NtCreateFile path='%s' host='%s' policy='%s' handle=%u status=0x%08x"
-        " access=0x%08x disposition=%u options=0x%08x\n",
-        guest_path,
-        host_path,
-        policy,
-        (unsigned)guest_handle,
-        (unsigned)status,
-        (unsigned)desired_access,
-        (unsigned)create_disposition,
-        (unsigned)create_options);
+    if (verbose_io_log() || status != RECOMP_STATUS_SUCCESS) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtCreateFile path='%s' host='%s' policy='%s' handle=%u status=0x%08x"
+            " access=0x%08x disposition=%u options=0x%08x\n",
+            guest_path,
+            host_path,
+            policy,
+            (unsigned)guest_handle,
+            (unsigned)status,
+            (unsigned)desired_access,
+            (unsigned)create_disposition,
+            (unsigned)create_options);
+    }
 
     if (file_handle_ptr != 0u) {
         *recomp_memory_u32(file_handle_ptr) = guest_handle;
@@ -1728,16 +1742,18 @@ static void bridge_nt_query_information_file(void)
             status == RECOMP_STATUS_SUCCESS ? length : 0u;
     }
 
-    fprintf(
-        stderr,
-        "recomp kernel: NtQueryInformationFile handle=%u class=%u len=%u"
-        " size=%llu policy='%s' status=0x%08x\n",
-        (unsigned)guest_handle,
-        (unsigned)file_information_class,
-        (unsigned)length,
-        (unsigned long long)file_size,
-        policy,
-        (unsigned)status);
+    if (verbose_io_log() || status != RECOMP_STATUS_SUCCESS) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtQueryInformationFile handle=%u class=%u len=%u"
+            " size=%llu policy='%s' status=0x%08x\n",
+            (unsigned)guest_handle,
+            (unsigned)file_information_class,
+            (unsigned)length,
+            (unsigned long long)file_size,
+            policy,
+            (unsigned)status);
+    }
 
     kernel_return(5u, status);
 }
@@ -1964,16 +1980,18 @@ static void bridge_nt_set_information_file(void)
             status == RECOMP_STATUS_SUCCESS ? length : 0u;
     }
 
-    fprintf(
-        stderr,
-        "recomp kernel: NtSetInformationFile handle=%u class=%u len=%u"
-        " value=%llu policy='%s' status=0x%08x\n",
-        (unsigned)guest_handle,
-        (unsigned)file_information_class,
-        (unsigned)length,
-        (unsigned long long)value,
-        policy,
-        (unsigned)status);
+    if (verbose_io_log() || status != RECOMP_STATUS_SUCCESS) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtSetInformationFile handle=%u class=%u len=%u"
+            " value=%llu policy='%s' status=0x%08x\n",
+            (unsigned)guest_handle,
+            (unsigned)file_information_class,
+            (unsigned)length,
+            (unsigned long long)value,
+            policy,
+            (unsigned)status);
+    }
 
     kernel_return(5u, status);
 }
@@ -2085,17 +2103,20 @@ finish:
         *recomp_memory_u32(io_status_block) = status;
         *recomp_memory_u32(io_status_block + 4u) = bytes_written;
     }
-    fprintf(
-        stderr,
-        "recomp kernel: NtQueryDirectoryFile handle=%u class=%u len=%u"
-        " restart=%u cursor=%zu policy='%s' status=0x%08x\n",
-        (unsigned)guest_handle,
-        (unsigned)file_information_class,
-        (unsigned)length,
-        (unsigned)restart_scan,
-        cursor,
-        policy,
-        (unsigned)status);
+    if (verbose_io_log() ||
+        (status != RECOMP_STATUS_SUCCESS && status != RECOMP_STATUS_NO_MORE_FILES)) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtQueryDirectoryFile handle=%u class=%u len=%u"
+            " restart=%u cursor=%zu policy='%s' status=0x%08x\n",
+            (unsigned)guest_handle,
+            (unsigned)file_information_class,
+            (unsigned)length,
+            (unsigned)restart_scan,
+            cursor,
+            policy,
+            (unsigned)status);
+    }
     kernel_return(10u, status);
 }
 
@@ -2203,17 +2224,19 @@ static void bridge_nt_write_file(void)
         *recomp_memory_u32(io_status_block + 4u) = bytes_written;
     }
 
-    fprintf(
-        stderr,
-        "recomp kernel: NtWriteFile handle=%u buffer=0x%08x len=%u"
-        " offset=%llu written=%u policy='%s' status=0x%08x\n",
-        (unsigned)guest_handle,
-        (unsigned)buffer,
-        (unsigned)length,
-        (unsigned long long)write_offset,
-        (unsigned)bytes_written,
-        policy,
-        (unsigned)status);
+    if (verbose_io_log() || status != RECOMP_STATUS_SUCCESS || bytes_written != length) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtWriteFile handle=%u buffer=0x%08x len=%u"
+            " offset=%llu written=%u policy='%s' status=0x%08x\n",
+            (unsigned)guest_handle,
+            (unsigned)buffer,
+            (unsigned)length,
+            (unsigned long long)write_offset,
+            (unsigned)bytes_written,
+            policy,
+            (unsigned)status);
+    }
 
     if (interrupt_after_write) {
         fprintf(stderr, "recomp save fault: interrupt after write=%u\n", save_write_number);
@@ -2373,17 +2396,20 @@ static void bridge_nt_read_file(void)
         *recomp_memory_u32(io_status_block + 4u) = bytes_read;
     }
 
-    fprintf(
-        stderr,
-        "recomp kernel: NtReadFile handle=%u buffer=0x%08x len=%u"
-        " offset=%llu read=%u policy='%s' status=0x%08x\n",
-        (unsigned)guest_handle,
-        (unsigned)buffer,
-        (unsigned)length,
-        (unsigned long long)read_offset,
-        (unsigned)bytes_read,
-        policy,
-        (unsigned)status);
+    if (verbose_io_log() ||
+        (status != RECOMP_STATUS_SUCCESS && status != RECOMP_STATUS_END_OF_FILE)) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtReadFile handle=%u buffer=0x%08x len=%u"
+            " offset=%llu read=%u policy='%s' status=0x%08x\n",
+            (unsigned)guest_handle,
+            (unsigned)buffer,
+            (unsigned)length,
+            (unsigned long long)read_offset,
+            (unsigned)bytes_read,
+            policy,
+            (unsigned)status);
+    }
 
     if (kernel_arg(3u) != 0u && (status & 0xc0000000u) != 0xc0000000u) {
         recomp_kernel_queue_user_apc(
@@ -2417,8 +2443,10 @@ static void bridge_nt_fs_control_file(void)
         *recomp_memory_u32(iosb) = status;
         *recomp_memory_u32(iosb + 4u) = 0u;
     }
-    fprintf(stderr, "recomp kernel: NtFsControlFile handle=%u code=0x%08x status=0x%08x\n",
-        (unsigned)handle, (unsigned)code, (unsigned)status);
+    if (verbose_io_log() || status != RECOMP_STATUS_SUCCESS) {
+        fprintf(stderr, "recomp kernel: NtFsControlFile handle=%u code=0x%08x status=0x%08x\n",
+            (unsigned)handle, (unsigned)code, (unsigned)status);
+    }
     kernel_return(10u, status);
 }
 
@@ -2456,13 +2484,15 @@ static void bridge_nt_device_io_control_file(void)
         *recomp_memory_i8(input_buffer + 0x38u) = 1;
     }
 
-    fprintf(
-        stderr,
-        "recomp kernel: NtDeviceIoControlFile code=0x%08x input=0x%08x len=%u status=0x%08x\n",
-        (unsigned)io_control_code,
-        (unsigned)input_buffer,
-        (unsigned)input_buffer_length,
-        (unsigned)status);
+    if (verbose_io_log() || status != RECOMP_STATUS_SUCCESS) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtDeviceIoControlFile code=0x%08x input=0x%08x len=%u status=0x%08x\n",
+            (unsigned)io_control_code,
+            (unsigned)input_buffer,
+            (unsigned)input_buffer_length,
+            (unsigned)status);
+    }
 
     kernel_return(10u, status);
 }
@@ -2502,12 +2532,14 @@ static void bridge_nt_query_volume_information_file(void)
         *recomp_memory_u32(fs_information + 20u) = 0x200u;
     }
 
-    fprintf(
-        stderr,
-        "recomp kernel: NtQueryVolumeInformationFile class=%u len=%u status=0x%08x\n",
-        (unsigned)fs_information_class,
-        (unsigned)length,
-        (unsigned)status);
+    if (verbose_io_log() || status != RECOMP_STATUS_SUCCESS) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtQueryVolumeInformationFile class=%u len=%u status=0x%08x\n",
+            (unsigned)fs_information_class,
+            (unsigned)length,
+            (unsigned)status);
+    }
 
     kernel_return(5u, status);
 }
@@ -2532,16 +2564,15 @@ static void bridge_io_create_symbolic_link(void)
     copy_guest_object_string(link_name, link, sizeof link);
     copy_guest_object_string(device_name, device, sizeof device);
     ensure_symbolic_links_initialized();
-    fprintf(
-        stderr,
-        "recomp kernel: IoCreateSymbolicLink '%s' -> '%s'\n",
-        link,
-        device);
-    kernel_return(
-        2u,
-        recomp_symbolic_link_create(&symbolic_links, link, device)
-            ? RECOMP_STATUS_SUCCESS
-            : RECOMP_STATUS_NO_MEMORY);
+    const bool ok = recomp_symbolic_link_create(&symbolic_links, link, device);
+    if (verbose_io_log() || !ok) {
+        fprintf(
+            stderr,
+            "recomp kernel: IoCreateSymbolicLink '%s' -> '%s'\n",
+            link,
+            device);
+    }
+    kernel_return(2u, ok ? RECOMP_STATUS_SUCCESS : RECOMP_STATUS_NO_MEMORY);
 }
 
 static void bridge_io_delete_symbolic_link(void)
@@ -2581,13 +2612,15 @@ static void bridge_nt_open_symbolic_link_object(void)
         *recomp_memory_u32(link_handle) = guest_handle;
         status = RECOMP_STATUS_SUCCESS;
     }
-    fprintf(
-        stderr,
-        "recomp kernel: NtOpenSymbolicLinkObject path='%s' handle=%u"
-        " status=0x%08x\n",
-        link,
-        (unsigned)guest_handle,
-        (unsigned)status);
+    if (verbose_io_log() || status != RECOMP_STATUS_SUCCESS) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtOpenSymbolicLinkObject path='%s' handle=%u"
+            " status=0x%08x\n",
+            link,
+            (unsigned)guest_handle,
+            (unsigned)status);
+    }
     kernel_return(2u, status);
 }
 
@@ -2624,14 +2657,16 @@ static void bridge_nt_query_symbolic_link_object(void)
             }
         }
     }
-    fprintf(
-        stderr,
-        "recomp kernel: NtQuerySymbolicLinkObject handle=%u target='%s'"
-        " length=%u status=0x%08x\n",
-        (unsigned)guest_handle,
-        target,
-        (unsigned)length,
-        (unsigned)status);
+    if (verbose_io_log() || status != RECOMP_STATUS_SUCCESS) {
+        fprintf(
+            stderr,
+            "recomp kernel: NtQuerySymbolicLinkObject handle=%u target='%s'"
+            " length=%u status=0x%08x\n",
+            (unsigned)guest_handle,
+            target,
+            (unsigned)length,
+            (unsigned)status);
+    }
     kernel_return(3u, status);
 }
 

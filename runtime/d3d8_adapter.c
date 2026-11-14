@@ -14,7 +14,18 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+static bool verbose_d3d_log(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("RECOMP_VERBOSE_D3D_LOG");
+        enabled = (value != NULL && strcmp(value, "1") == 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
 
 /* D3D8 5455 in SC2: DOA2U's 5849 device fields at their 5455 offsets
    (tools/sc2/port_d3d.py, docs/bring-up.md). */
@@ -672,8 +683,10 @@ static void clear(void)
         black_band(&target, 0u, cleared_top);
         black_band(&target, cleared_bottom, target.color.height);
     }
-    fprintf(stderr, "recomp d3d8: Clear flags=%08" PRIx32 " color=%08x z=%08x stencil=%u\n", argument(entry, 2u),
-        argument(entry, 3u), argument(entry, 4u), argument(entry, 5u));
+    if (verbose_d3d_log()) {
+        fprintf(stderr, "recomp d3d8: Clear flags=%08" PRIx32 " color=%08x z=%08x stencil=%u\n",
+            argument(entry, 2u), argument(entry, 3u), argument(entry, 4u), argument(entry, 5u));
+    }
     recomp_runtime.registers.esp = entry + 28u;
 }
 
@@ -710,7 +723,9 @@ static void swap(void)
     if (recomp_d3d_present_hook != NULL) recomp_d3d_present_hook(result.command.data.present.swap_counter);
     recomp_runtime.registers.eax = result.command.data.present.swap_counter;
     recomp_runtime.registers.esp = entry + 8u;
-    if (!sc2_fast_forward) fprintf(stderr, "recomp d3d8: Swap frame=%u\n", result.command.data.present.swap_counter);
+    if (!sc2_fast_forward && (result.command.data.present.swap_counter == 1u || verbose_d3d_log())) {
+        fprintf(stderr, "recomp d3d8: Swap frame=%u\n", result.command.data.present.swap_counter);
+    }
 }
 
 void recomp_d3d8_present_card(const uint32_t *pixels, uint32_t width, uint32_t height,
