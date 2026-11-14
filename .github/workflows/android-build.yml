@@ -145,7 +145,7 @@ jobs:
           fi
 
           git submodule update --init --depth 1 tools/xboxrecomp
-          mkdir -p private/disc
+          mkdir -p private/disc private/program/none private/logs
           curl -fsSL -o private/disc/Default.xbe "$XBE_URL"
           python3 -m venv private/venv
           private/venv/bin/pip install -q capstone==5.0.7
