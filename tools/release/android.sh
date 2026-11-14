@@ -105,7 +105,7 @@ if [ -n "${GAME_DISC:-}" ]; then
     apk="$root/build/Soulcalibur2Recomp-android-with-game-DO-NOT-SHARE.apk"
     echo "packing $GAME_DISC${GUESTS:+ and $GUESTS}: a development build, not to be shared"
 fi
-set -- -PstagedDir="$staged" -PsdlDir="$sdl"
+set -- -PstagedDir="$staged" -PsdlDir="$sdl" -PversionCode="${ANDROID_VERSION_CODE:-2}"
 if [ -n "${KEYSTORE:-}" ]; then
     set -- "$@" -PkeyStore="$KEYSTORE" -PkeyStorePassword="$KEYSTORE_PASSWORD" -PkeyAlias="$KEY_ALIAS" -PkeyPassword="$KEY_PASSWORD"
 fi

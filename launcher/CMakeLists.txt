@@ -14,7 +14,7 @@ endif()
 
 set(LAUNCHER_GAME_NAME "Soulcalibur II")
 set(LAUNCHER_GAME_EXE soulcalibur2)
-set(LAUNCHER_APP_ID io.github.tmcleroy.soulcalibur2)
+set(LAUNCHER_APP_ID io.github.ekosaputro14.soulcalibur2)
 set(LAUNCHER_HOME_ENV SOULCALIBUR2_HOME)
 set(LAUNCHER_DISCLAIMER "Not affiliated with Bandai Namco.")
 # (and the runtime's disc image reader, to check a disc image)
@@ -24,7 +24,7 @@ set(LAUNCHER_PORT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/description.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/textures_page.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/sc2_settings.cpp)
 # (the launcher updates itself from the releases: each system's manifest and archive, tools/release/)
-set(LAUNCHER_UPDATE_REPO tmcleroy/soulcalibur2-recomp)
+set(LAUNCHER_UPDATE_REPO EkoSaputro14/soulcalibur2-recomp)
 file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/../VERSION LAUNCHER_VERSION LIMIT_COUNT 1)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../VERSION)
 include(../recomp-common/launcher/launcher.cmake)

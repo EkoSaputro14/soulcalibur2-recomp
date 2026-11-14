@@ -40,6 +40,9 @@ public class GameActivity extends SDLActivity {
             Os.setenv("RECOMP_FOLDER", text(intent.getStringExtra(EXTRA_FOLDER)), true);
             Os.setenv("RECOMP_LOG", text(intent.getStringExtra(EXTRA_LOG)), true);
             Os.setenv("SC2_SHADERS", unpackShaders().getPath(), true);
+            File shaderCache = new File(getCacheDir(), "shader_cache");
+            shaderCache.mkdirs();
+            Os.setenv("RECOMP_SHADER_CACHE", shaderCache.getPath(), true);
             testVariables();
         } catch (ErrnoException e) {
             Log.w("soulcalibur2", "setenv: " + e);
