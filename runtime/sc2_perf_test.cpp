@@ -98,19 +98,21 @@ void decodeBlockLevelReference(const uint8_t *src, uint32_t width, uint32_t heig
 
 void testCpuAffinity()
 {
-    // Case 1: 6x 1.80 GHz + 2x 2.30 GHz unthrottled -> selects all 8 (>= 70% of 2.30 GHz = 1.61 GHz).
+    // Case 1: 6x 1.80 GHz LITTLE + 2x 2.30 GHz BIG unthrottled -> selects ONLY the 2x 2.30 GHz performance cores
+    // so the single-threaded Main Game + Inline Presenter Thread is never migrated onto slow LITTLE cores.
     std::vector<sc2::CpuFreqInfo> unthrottled(8);
     for (int i = 0; i < 6; ++i) unthrottled[i] = {true, 1804800, 1804800};
     for (int i = 6; i < 8; ++i) unthrottled[i] = {true, 2304000, 2304000};
     const auto c1 = sc2::SelectActiveCores(unthrottled);
-    CHECK((c1 == std::vector<int>{0, 1, 2, 3, 4, 5, 6, 7}));
+    CHECK((c1 == std::vector<int>{6, 7}));
 
-    // Case 2: Prime cluster throttled (2.30 GHz hardware throttled to 1.21 GHz scaling_max_freq) -> migrates to 6x 1.80 GHz!
+    // Case 2: 2+6 SoC when BIG cluster thermally throttles (2.30 GHz hardware throttled to 1.21 GHz scaling_max_freq)
+    // -> stays on the 2x out-of-order BIG cores ({6, 7}) instead of evicting to in-order LITTLE cores or oscillating 6/8 <-> 8/8.
     std::vector<sc2::CpuFreqInfo> throttled = unthrottled;
     throttled[6].scaling_max_khz = 1209600;
     throttled[7].scaling_max_khz = 1209600;
     const auto c2 = sc2::SelectActiveCores(throttled);
-    CHECK((c2 == std::vector<int>{0, 1, 2, 3, 4, 5}));
+    CHECK((c2 == std::vector<int>{6, 7}));
 
     // Case 3: Flagship 1x 2.8 GHz + 3x 2.4 GHz + 4x 1.8 GHz -> picks 4 fast cores, skips slow 4x 1.8 GHz.
     std::vector<sc2::CpuFreqInfo> flagship = {
@@ -122,14 +124,20 @@ void testCpuAffinity()
     const auto c3 = sc2::SelectActiveCores(flagship);
     CHECK((c3 == std::vector<int>{4, 5, 6, 7}));
 
-    // Case 4: Offline prime cores and min-4 floor.
-    std::vector<sc2::CpuFreqInfo> two_fast_only = {
+    // Case 3b: Flagship 1+3+4 when single Prime core throttles to 1.4 GHz -> selects 3 unthrottled Mid performance cores.
+    std::vector<sc2::CpuFreqInfo> flagship_throttled = flagship;
+    flagship_throttled[7].scaling_max_khz = 1400000;
+    const auto c3b = sc2::SelectActiveCores(flagship_throttled);
+    CHECK((c3b == std::vector<int>{4, 5, 6}));
+
+    // Case 4: Only 1 performance core online -> falls back to incluir LITTLE cores so >= 2 cores are available.
+    std::vector<sc2::CpuFreqInfo> one_fast_only = {
         {true, 1400000, 1400000}, {true, 1400000, 1400000},
         {true, 1400000, 1400000}, {true, 1400000, 1400000},
         {true, 2400000, 2400000}, {false, 2400000, 2400000},
     };
-    const auto c4 = sc2::SelectActiveCores(two_fast_only);
-    CHECK(c4.size() == 5u); // 1x 2.4 GHz + 4x 1.4 GHz cluster
+    const auto c4 = sc2::SelectActiveCores(one_fast_only);
+    CHECK(c4.size() == 5u);
 
     // Case 5: Unknown/zero frequencies -> empty.
     const auto c5 = sc2::SelectActiveCores({{true, 0, 0}, {false, 1800000, 1800000}});
@@ -212,6 +220,19 @@ void testTextureCachePolicy()
     CHECK(!sc2::ShouldFlushLinearBgraUpdate(2u, 2u, false));
     // Must flush when active segment already queued at least one draw sampling this texture.
     CHECK(sc2::ShouldFlushLinearBgraUpdate(2u, 2u, true));
+
+    // Linear BGRA row hashing: ignores pitch padding bytes and detects any active texel modification.
+    std::vector<uint8_t> contiguous(16u * 4u, 0x5au);
+    std::vector<uint8_t> padded(32u * 4u, 0xffu);
+    for (uint32_t y = 0u; y < 4u; ++y) {
+        std::memcpy(padded.data() + y * 32u, contiguous.data() + y * 16u, 16u);
+    }
+    const uint64_t h1 = sc2::HashLinearBgraRows(contiguous.data(), 16u, 4u, 16u);
+    const uint64_t h2 = sc2::HashLinearBgraRows(padded.data(), 16u, 4u, 32u);
+    CHECK(h1 == h2);
+    padded[2u * 32u + 7u] ^= 0x01u;
+    const uint64_t h3 = sc2::HashLinearBgraRows(padded.data(), 16u, 4u, 32u);
+    CHECK(h1 != h3);
 
     // LRU slot selection: prefers unused slots first, then picks strictly lowest last_used.
     bool used[4] = {true, false, true, true};

@@ -29,6 +29,9 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __ANDROID__
+#include <sched.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -79,10 +82,21 @@ std::atomic<uint64_t> g_perf_tex_decode_ns{0u};
 std::atomic<uint64_t> g_perf_flush_ns{0u};
 std::atomic<uint64_t> g_perf_present_wait_ns{0u};
 std::atomic<uint64_t> g_perf_present_total_ns{0u};
+std::atomic<uint64_t> g_perf_max_frame_draw_ns{0u};
+std::atomic<uint64_t> g_perf_max_frame_flush_ns{0u};
+std::atomic<uint64_t> g_perf_max_frame_present_ns{0u};
 std::atomic<uint32_t> g_perf_draws{0u};
 std::atomic<uint32_t> g_perf_uploads{0u};
 std::atomic<uint32_t> g_perf_dxt_decodes{0u};
 std::atomic<uint32_t> g_perf_flushes{0u};
+uint64_t g_frame_draw_ns = 0u;
+uint64_t g_frame_flush_ns = 0u;
+
+inline void atomicUpdateMax(std::atomic<uint64_t> &target, uint64_t value)
+{
+    uint64_t prev = target.load(std::memory_order_relaxed);
+    while (prev < value && !target.compare_exchange_weak(prev, value, std::memory_order_relaxed)) {}
+}
 
 inline uint64_t steadyNowNs()
 {
@@ -112,7 +126,13 @@ bool fileExists(const char *path)
 uint64_t hashBytes(const void *bytes, size_t count, uint64_t hash = 0xcbf29ce484222325ull)
 {
     const auto *data = static_cast<const uint8_t *>(bytes);
-    for (size_t i = 0u; i < count; ++i) hash = (hash ^ data[i]) * 0x100000001b3ull;
+    const size_t words = count / 8u;
+    for (size_t i = 0u; i < words; ++i) {
+        uint64_t w;
+        std::memcpy(&w, data + i * 8u, sizeof w);
+        hash = (hash ^ w) * 0x100000001b3ull;
+    }
+    for (size_t i = words * 8u; i < count; ++i) hash = (hash ^ data[i]) * 0x100000001b3ull;
     return hash;
 }
 
@@ -1129,8 +1149,9 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const TextureLookup
     }
     const auto cached = presenter->texture_index.equal_range(desc.data);
     const bool fingerprinted = !linear_bgra && req.texture_bytes != nullptr;
-    const uint64_t fingerprint = fingerprinted
-        ? textureFingerprint(req.texture_bytes, req.texture_byte_count) : 0u;
+    const uint64_t fingerprint = linear_bgra
+        ? sc2::HashLinearBgraRows(req.texture_bytes, desc.width * 4u, desc.height, desc.pitch)
+        : (fingerprinted ? textureFingerprint(req.texture_bytes, req.texture_byte_count) : 0u);
     for (auto it = cached.first; it != cached.second; ++it) {
         const uint32_t slot = it->second;
         TextureEntry &entry = presenter->textures[slot];
@@ -1153,7 +1174,7 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const TextureLookup
                 presenter->texture_last_used[slot] = 0u;
                 break;
             }
-            if (linear_bgra) {
+            if (linear_bgra && entry.fingerprint != fingerprint) {
                 // Only flush if an already-queued draw in THIS segment sampled this texture.
                 if (sc2::ShouldFlushLinearBgraUpdate(entry.last_segment_id, presenter->segment_id,
                         !presenter->segment.draws.empty())) {
@@ -1173,6 +1194,7 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const TextureLookup
                     upload_bytes = packed.data();
                 }
                 uploadTexture(presenter, entry.texture, upload_bytes, upload_size, 0u, desc.width, desc.height);
+                entry.fingerprint = fingerprint;
             }
             entry.last_used = ++presenter->texture_use_clock;
             entry.last_segment_id = presenter->segment_id;
@@ -1413,6 +1435,17 @@ void precompileSavedPipelines(RecompD3dPresenter *presenter);
 
 void precompileDrawShaders(RecompD3dPresenter *presenter)
 {
+#ifdef __ANDROID__
+    // Allow background shader/pipeline warmup to schedule across all online cores so it
+    // does not contend with the main game thread on the performance cluster.
+    const int cpu_count = static_cast<int>(sysconf(_SC_NPROCESSORS_CONF));
+    if (cpu_count > 0) {
+        cpu_set_t all_cpus;
+        CPU_ZERO(&all_cpus);
+        for (int cpu = 0; cpu < cpu_count; ++cpu) CPU_SET(cpu, &all_cpus);
+        sched_setaffinity(0, sizeof all_cpus, &all_cpus);
+    }
+#endif
     const auto start = std::chrono::steady_clock::now();
     unsigned compiled = 0u;
     for (const uint32_t fvf : kRecompD3dBootDrawFvfs) {
@@ -2078,7 +2111,9 @@ void flushSegment(RecompD3dPresenter *presenter)
     segment.uniform_data.clear();
     ++presenter->segment_id;
     releaseRetiredTextures(presenter);
-    g_perf_flush_ns.fetch_add(steadyNowNs() - t0, std::memory_order_relaxed);
+    const uint64_t flush_elapsed = steadyNowNs() - t0;
+    g_perf_flush_ns.fetch_add(flush_elapsed, std::memory_order_relaxed);
+    g_frame_flush_ns += flush_elapsed;
     g_perf_flushes.fetch_add(1u, std::memory_order_relaxed);
 }
 
@@ -2426,7 +2461,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
         const int bottom = static_cast<int>(std::min<double>(edges[3], bound.host_height));
         scissor = {left, top, right - left, bottom - top};
     }
-    if (draw.has_texture) {
+    if (!general && draw.has_texture) {
         const RenderTargetEntry *sampled = findRenderTarget(presenter, draw.texture);
         if (sampled != nullptr && sampled->render == bound.color) {
             std::fprintf(stderr, "recomp d3d presenter: cannot sample active render target data=0x%08X\n",
@@ -2436,7 +2471,8 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     }
     useTarget(presenter, bound.color, bound.depth);
 
-    SDL_GPUTexture *texture = draw.has_texture ? lookupTexture(presenter, makeLookupRequest(draw)) : nullptr;
+    SDL_GPUTexture *texture = (!general && draw.has_texture)
+        ? lookupTexture(presenter, makeLookupRequest(draw)) : nullptr;
     /* A general pixel program samples its stage textures, in slots 0 to 2. */
     SDL_GPUTexture *stage_texture[3]{};
     if (general) {
@@ -2462,6 +2498,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
                 return unsupportedDraw(__LINE__);
             }
         }
+        texture = stage_texture[0];
     }
     SDL_GPUTexture *mask = nullptr, *bump = nullptr;
     if (draw.has_alpha_mask) {
@@ -3485,7 +3522,13 @@ RecompD3dPresenterError submitPresent(RecompD3dPresenter *presenter, const Recom
         std::fprintf(stderr, "recomp draw log: begin present=%u\n", presenter->present_count + 1u);
     }
     if (presenter->performance_counter) reportPerformance(presenter);
-    g_perf_present_total_ns.fetch_add(steadyNowNs() - present_t0, std::memory_order_relaxed);
+    const uint64_t present_elapsed = steadyNowNs() - present_t0;
+    g_perf_present_total_ns.fetch_add(present_elapsed, std::memory_order_relaxed);
+    atomicUpdateMax(g_perf_max_frame_draw_ns, g_frame_draw_ns);
+    atomicUpdateMax(g_perf_max_frame_flush_ns, g_frame_flush_ns);
+    atomicUpdateMax(g_perf_max_frame_present_ns, present_elapsed);
+    g_frame_draw_ns = 0u;
+    g_frame_flush_ns = 0u;
     return RECOMP_D3D_PRESENTER_OK;
 }
 
@@ -3817,6 +3860,7 @@ RecompD3dPresenterError d3d_backend_submit(RecompD3dPresenter *presenter, const 
         const auto error = submitDraw(presenter, command->data.draw);
         const uint64_t elapsed_ns = steadyNowNs() - t0;
         g_perf_draw_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+        g_frame_draw_ns += elapsed_ns;
         g_perf_draws.fetch_add(1u, std::memory_order_relaxed);
         if (presenter->draw_log_active) {
             logDraw(presenter, command->data.draw, error, static_cast<double>(elapsed_ns) / 1000.0);
@@ -4229,6 +4273,9 @@ extern "C" void recomp_d3d_presenter_take_perf(RecompD3dPresenterPerf *out)
     out->flush_ns = g_perf_flush_ns.exchange(0u, std::memory_order_relaxed);
     out->present_wait_ns = g_perf_present_wait_ns.exchange(0u, std::memory_order_relaxed);
     out->present_total_ns = g_perf_present_total_ns.exchange(0u, std::memory_order_relaxed);
+    out->max_frame_draw_ns = g_perf_max_frame_draw_ns.exchange(0u, std::memory_order_relaxed);
+    out->max_frame_flush_ns = g_perf_max_frame_flush_ns.exchange(0u, std::memory_order_relaxed);
+    out->max_frame_present_ns = g_perf_max_frame_present_ns.exchange(0u, std::memory_order_relaxed);
     out->draws = g_perf_draws.exchange(0u, std::memory_order_relaxed);
     out->uploads = g_perf_uploads.exchange(0u, std::memory_order_relaxed);
     out->dxt_decodes = g_perf_dxt_decodes.exchange(0u, std::memory_order_relaxed);

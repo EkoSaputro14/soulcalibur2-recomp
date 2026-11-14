@@ -279,7 +279,9 @@ void sc2_android_start()
         toSystemLog();
     }
     reportCrashes();
-    applyCoreAffinity(true);
+    // Leave process startup affinity unrestricted so background threads (recomp_host_pump,
+    // AAudio, Vulkan driver workers, shader precompile) can be scheduled across all cores
+    // while sc2_android_frame pins only the heavy Main Game + Inline Presenter Thread.
     recomp_host_pump_start();
 }
 
@@ -301,6 +303,8 @@ extern "C" void sc2_android_frame(void)
         if (const char *pin = std::getenv("SC2_FASTEST_CORE"); pin != nullptr && *pin == '1') {
             fastestCore();
             pinned_fastest = true;
+        } else {
+            applyCoreAffinity(true);
         }
         last_affinity_check = now;
     } else if (!pinned_fastest && now - last_affinity_check >= 2000000000ull) {
@@ -318,7 +322,7 @@ extern "C" void sc2_android_frame(void)
         std::fprintf(stderr,
             "soulcalibur2 speed: %.1f frames a second, longest frame %.1f ms, sound gaps %llu "
             "(caps %s) | draw=%.2f upload=%.2f dec=%.2f flush=%.2f pres=%.2f wait=%.2f vblank=%.2f ms/f "
-            "(d=%u u=%u dec=%u f=%u)\n",
+            "max(d=%.1f f=%.1f p=%.1f ms) (d=%u u=%u dec=%u f=%u)\n",
             frames * 1e9 / double(now - window_start), longest / 1e6, gaps - gaps_before,
             coreCaps().c_str(),
             (perf.draw_ns / 1e6) / denom,
@@ -328,6 +332,9 @@ extern "C" void sc2_android_frame(void)
             (perf.present_total_ns / 1e6) / denom,
             (perf.present_wait_ns / 1e6) / denom,
             vblank_ms / denom,
+            perf.max_frame_draw_ns / 1e6,
+            perf.max_frame_flush_ns / 1e6,
+            perf.max_frame_present_ns / 1e6,
             perf.draws, perf.uploads, perf.dxt_decodes, perf.flushes);
         std::fflush(stderr);
         gaps_before = gaps;

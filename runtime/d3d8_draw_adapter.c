@@ -1199,24 +1199,60 @@ static bool fixed_stages(uint32_t device, const RecompD3dVertexLayout *layout,
 static uint32_t declaration_layout(uint32_t object, bool program);
 static uint32_t program_remap[16];
 
+typedef struct {
+    bool active;
+    uint32_t count;
+    struct { uint32_t stream, offset, size; } part[8];
+} GatherPlan;
+static GatherPlan gather;
+
 static void attach_program(uint32_t device, RecompD3dPresenterDrawCommand *draw)
 {
     const uint32_t handle = draw->fvf;
     uint32_t words[0x114u / 4u];
     recomp_guest_load(words, handle - 1u, sizeof words);
-    /* The declaration's registers in FVF order, gathered from its streams
-       when needed (declaration_fvf); the program reads v0, v2, v3, v9-v12. */
-    const uint32_t fvf = declaration_layout(handle - 1u, true);
-    if (words[3] > 680u || !recomp_d3d_unpack_vertex_program(
-            (const uint32_t *)(const void *)recomp_memory(handle - 1u + 0x114u, words[3] * 4u),
-            words[3], words[2], draw->program))
+    if (words[2] > 136u || words[3] > 680u)
         recomp_stop(2, "d3d8:vertex-program-unsupported:%08x", handle);
-    /* Inputs read their remapped registers (declaration_layout). */
-    for (uint32_t i = 0u; i < words[2]; ++i) {
-        const uint32_t a = draw->program[i][1], attribute = (a >> 9) & 15u;
-        draw->program[i][1] = (a & ~(15u << 9)) | program_remap[attribute] << 9;
+    const uint32_t *bytecode =
+        (const uint32_t *)(const void *)recomp_memory(handle - 1u + 0x114u, words[3] * 4u);
+
+    static uint32_t cached_handle;
+    static uint32_t cached_words[0x114u / 4u];
+    static uint32_t cached_bytecode[680u];
+    static uint32_t cached_fvf;
+    static GatherPlan cached_gather;
+    static uint32_t cached_program_count;
+    static uint32_t cached_program[136u][4u];
+
+    uint32_t fvf;
+    if (cached_handle == handle &&
+        memcmp(words, cached_words, sizeof words) == 0 &&
+        memcmp(bytecode, cached_bytecode, (size_t)words[3] * 4u) == 0) {
+        fvf = cached_fvf;
+        gather = cached_gather;
+        draw->program_count = cached_program_count;
+        memcpy(draw->program, cached_program, (size_t)cached_program_count * sizeof draw->program[0]);
+    } else {
+        /* The declaration's registers in FVF order, gathered from its streams
+           when needed (declaration_fvf); the program reads v0, v2, v3, v9-v12. */
+        fvf = declaration_layout(handle - 1u, true);
+        if (!recomp_d3d_unpack_vertex_program(bytecode, words[3], words[2], draw->program))
+            recomp_stop(2, "d3d8:vertex-program-unsupported:%08x", handle);
+        /* Inputs read their remapped registers (declaration_layout). */
+        for (uint32_t i = 0u; i < words[2]; ++i) {
+            const uint32_t a = draw->program[i][1], attribute = (a >> 9) & 15u;
+            draw->program[i][1] = (a & ~(15u << 9)) | program_remap[attribute] << 9;
+        }
+        draw->program_count = words[2];
+
+        cached_handle = handle;
+        memcpy(cached_words, words, sizeof words);
+        memcpy(cached_bytecode, bytecode, (size_t)words[3] * 4u);
+        cached_fvf = fvf;
+        cached_gather = gather;
+        cached_program_count = words[2];
+        memcpy(cached_program, draw->program, (size_t)words[2] * sizeof draw->program[0]);
     }
-    draw->program_count = words[2];
     recomp_guest_load(draw->program_constants, 0x0015d570u, sizeof draw->program_constants);
     RecompD3dViewport viewport;
     float scale[2], framebuffer[2], offset[2], depth;
@@ -1495,12 +1531,8 @@ enum { VSDT_NONE = 0x02u, VSDT_FLOAT2 = 0x22u, VSDT_FLOAT3 = 0x32u, VSDT_D3DCOLO
 
 /* How to build FVF-ordered vertices from a declaration's streams, when they
    are not already laid out as that FVF in stream 0 (SC2's models keep
-   position and normal in stream 0, diffuse and UV in stream 1). */
-static struct {
-    bool active;
-    uint32_t count;
-    struct { uint32_t stream, offset, size; } part[8];
-} gather;
+   position and normal in stream 0, diffuse and UV in stream 1).
+   `gather` is declared above attach_program. */
 static uint32_t gather_first;   /* the draw's first vertex index in the streams */
 /* SetModelView's model view while a composite overrides the device transforms. */
 static bool model_view_active;
@@ -1626,7 +1658,21 @@ static bool bind_stage_texture(uint32_t device, uint32_t i, const uint32_t *stat
 {
     RecompD3dPixelProgram *program = &draw->pixel_program;
     DrawTextureBinding texture = {0};
-    attach_texture_binding(device, i, draw->fvf, &texture);
+    if (i == 0u) {
+        texture.has_texture = draw->has_texture;
+        texture.texture = draw->texture;
+        texture.texture_bytes = draw->texture_bytes;
+        texture.texture_byte_count = draw->texture_byte_count;
+        texture.palette_bytes = draw->palette_bytes;
+        texture.palette_byte_count = draw->palette_byte_count;
+        texture.address_u = draw->address_u;
+        texture.address_v = draw->address_v;
+        texture.address_w = draw->address_w;
+        texture.texture_is_backbuffer = draw->texture_is_backbuffer;
+        texture.texture_is_front_buffer = draw->texture_is_front_buffer;
+    } else {
+        attach_texture_binding(device, i, draw->fvf, &texture);
+    }
     if (!texture.has_texture) return false;
     if (texture.texture_is_backbuffer || texture.texture.volume_depth != 0u)
         recomp_stop(2, "d3d8:general-texture-kind:stage=%u", i);

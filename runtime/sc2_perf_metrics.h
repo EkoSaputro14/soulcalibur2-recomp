@@ -15,6 +15,9 @@ typedef struct RecompD3dPresenterPerf {
     uint64_t flush_ns;
     uint64_t present_wait_ns;
     uint64_t present_total_ns;
+    uint64_t max_frame_draw_ns;
+    uint64_t max_frame_flush_ns;
+    uint64_t max_frame_present_ns;
     uint32_t draws;
     uint32_t uploads;
     uint32_t dxt_decodes;
