@@ -37,16 +37,22 @@ public class GameActivity extends SDLActivity {
         // (runtime/sc2_android.cpp reads these before anything else)
         Intent intent = getIntent();
         try {
-            Os.setenv("RECOMP_FOLDER", text(intent.getStringExtra(EXTRA_FOLDER)), true);
+            String folder = text(intent.getStringExtra(EXTRA_FOLDER));
+            Os.setenv("RECOMP_FOLDER", folder, true);
             Os.setenv("RECOMP_LOG", text(intent.getStringExtra(EXTRA_LOG)), true);
             Os.setenv("SC2_SHADERS", unpackShaders().getPath(), true);
-            File shaderCache = new File(getCacheDir(), "shader_cache");
+            File shaderCacheBase = !folder.isEmpty() ? new File(folder) : getExternalFilesDir(null);
+            if (shaderCacheBase == null) {
+                shaderCacheBase = getFilesDir();
+            }
+            File shaderCache = new File(shaderCacheBase, "shader_cache");
             shaderCache.mkdirs();
             Os.setenv("RECOMP_SHADER_CACHE", shaderCache.getPath(), true);
             testVariables();
         } catch (ErrnoException e) {
             Log.w("soulcalibur2", "setenv: " + e);
         }
+        setResult(RESULT_FIRST_USER);
         super.onCreate(savedInstanceState);
     }
 
@@ -181,6 +187,11 @@ public class GameActivity extends SDLActivity {
             }
         }
         return Slot0.class;
+    }
+
+    public void finishGame(int code) {
+        setResult(RESULT_FIRST_USER + code);
+        finish();
     }
 
     @Override

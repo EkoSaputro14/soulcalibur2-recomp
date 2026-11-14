@@ -356,6 +356,22 @@ bool prepare_folders(bool ask) {
 // The reason given to a run whose log says the system has no graphics API the game can draw with (no driver)
 static const char* const kGpuDriverReason = "gpu:no-driver";
 
+static bool log_says_normal_exit(const std::filesystem::path& folder) {
+    std::ifstream in(folder / "logs" / "game.log", std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::string line;
+    bool normal_exit = false;
+    while (std::getline(in, line)) {
+        if (line.find("recomp stop: ") != std::string::npos) {
+            normal_exit = (line.find("kind=normal-exit") != std::string::npos ||
+                           line.find("exit_code=0") != std::string::npos);
+        }
+    }
+    return normal_exit;
+}
+
 // The game's log is written over at each start: the log of a run that stopped with an error is kept beside it
 // (logs/stopped-<when>.log, the newest five), to send with a report
 StoppedLog keep_stopped_log(const std::filesystem::path& folder) {
@@ -363,7 +379,7 @@ StoppedLog keep_stopped_log(const std::filesystem::path& folder) {
     StoppedLog kept;
     const fs::path logs = folder / "logs";
     std::error_code error;
-    if (!fs::exists(logs / "game.log", error)) {
+    if (!fs::exists(logs / "game.log", error) || log_says_normal_exit(folder)) {
         return kept;
     }
     std::time_t now = std::time(nullptr);
@@ -537,7 +553,7 @@ int play_directly(const std::string& id, const std::vector<std::string>& extra) 
     const int code = game.exit_code();
     const bool next = the_collection() && std::any_of(the_collection()->multi.begin(), the_collection()->multi.end(),
                                                        [&](const launcher::MultiMode& m) { return m.next_code == code; });
-    if (code != 0 && !next) {
+    if (code != 0 && !next && !log_says_normal_exit(target->folder)) {
         const StoppedLog kept = keep_stopped_log(target->folder);
         std::string text = stopped_text(target->name, code, kept.reason) + ".";
         if (std::string meaning = stopped_meaning(code, kept.reason); !meaning.empty()) {
@@ -1555,7 +1571,7 @@ void App::frame() {
             after_game(one);
             show_focus_ = interactive_ && SDL_HasGamepad();  // (back from the game with a gamepad in hand)
             one.was_running = false;
-            if (one.game.exit_code() != 0 &&
+            if (one.game.exit_code() != 0 && !log_says_normal_exit(one.folder) &&
                 !(collection_ && std::any_of(collection_->multi.begin(), collection_->multi.end(),
                                              [&](const launcher::MultiMode& m) { return m.next_code == one.game.exit_code(); }))) {
                 keep_stopped_log(one);
@@ -2147,7 +2163,7 @@ bool App::play_button(size_t which, float width) {
     } else if (!one.play_error.empty()) {
         ui::gap(10);
         ui::text(one.play_error.c_str(), Font::Regular, ui::size::kDetail, p.danger, width);
-    } else if (!one.game.running() && one.game.exit_code() != 0 &&
+    } else if (!one.game.running() && one.game.exit_code() != 0 && !one.stopped_log.empty() &&
                !(collection_ && std::any_of(collection_->multi.begin(), collection_->multi.end(),
                                             [&](const launcher::MultiMode& m) { return m.next_code == one.game.exit_code(); }))) {
         stopped_note(one, width);
@@ -3233,7 +3249,7 @@ void App::library_page(float width) {
     games.end();
     // (what went wrong with each game's last start)
     for (const auto& one : slots_) {
-        if (one->play_error.empty() && !one->game.running() && one->game.exit_code() != 0) {
+        if (one->play_error.empty() && !one->game.running() && one->game.exit_code() != 0 && !one->stopped_log.empty()) {
             stopped_note(*one, width);
             continue;
         }

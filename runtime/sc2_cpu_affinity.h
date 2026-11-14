@@ -59,12 +59,17 @@ inline std::vector<int> SelectActiveCores(const std::vector<CpuFreqInfo> &cores)
 
     int perf_online = 0;
     long best_perf = 0;
+    long best_little = 0;
     if (max_info_max > min_info_max) {
         for (size_t i = 0; i < n; ++i) {
             const long hw_max = cores[i].info_max_khz > 0 ? cores[i].info_max_khz : effective[i];
-            if (effective[i] > 0 && hw_max > min_info_max) {
-                ++perf_online;
-                if (effective[i] > best_perf) best_perf = effective[i];
+            if (effective[i] > 0) {
+                if (hw_max > min_info_max) {
+                    ++perf_online;
+                    if (effective[i] > best_perf) best_perf = effective[i];
+                } else {
+                    if (effective[i] > best_little) best_little = effective[i];
+                }
             }
         }
     }
@@ -99,6 +104,22 @@ inline std::vector<int> SelectActiveCores(const std::vector<CpuFreqInfo> &cores)
             if (!picked[i] && isCandidate(i) && effective[i] == next_best) {
                 picked[i] = true;
                 ++picked_count;
+            }
+        }
+    }
+
+    // On 2+6 SoCs (perf_online == 2), if the 2 BIG cores are severely thermally throttled below
+    // 80% of the LITTLE cluster's effective clock (e.g. 1.21 GHz vs 1.80 GHz LITTLE), keep both
+    // BIG cores in the mask (never evict them) and add up to 2 highest-index LITTLE cores (4 cores total)
+    // so thermal pressure on the BIG cluster can subside and clock speed can recover.
+    if (use_perf_only && perf_online == 2 && best_little > 0 && best_perf * 100 < best_little * 80) {
+        int added_little = 0;
+        for (size_t idx = n; idx > 0 && added_little < 2; --idx) {
+            const size_t i = idx - 1;
+            if (!picked[i] && effective[i] > 0 && effective[i] == best_little) {
+                picked[i] = true;
+                ++picked_count;
+                ++added_little;
             }
         }
     }

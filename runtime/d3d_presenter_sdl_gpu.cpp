@@ -1446,14 +1446,55 @@ void precompileDrawShaders(RecompD3dPresenter *presenter)
         sched_setaffinity(0, sizeof all_cpus, &all_cpus);
     }
 #endif
+    // Warm up saved pipelines first so exact shaders + PSOs used by SC2 are ready immediately.
+    precompileSavedPipelines(presenter);
+    if (presenter->precompile_stop.load()) return;
+
     const auto start = std::chrono::steady_clock::now();
     unsigned compiled = 0u;
+
+    // Soulcalibur II routes non-point draws through general_fixed_stages (RECOMP_D3D_PIXEL_FIXED_STAGES).
+    // Precompile the common textured (MODULATE texture * diffuse) and untextured (SELECTARG1 diffuse)
+    // fixed-stage pixel programs alongside the base boot FVFs.
+    RecompD3dPixelProgram fixed_textured{};
+    fixed_textured.kind = RECOMP_D3D_PIXEL_FIXED_STAGES;
+    fixed_textured.stages[0].sampled = true;
+    fixed_textured.stages[0].color_op = 4u;
+    fixed_textured.stages[0].color_arg1 = 2u;
+    fixed_textured.stages[0].color_arg2 = 0u;
+    fixed_textured.stages[0].alpha_op = 4u;
+    fixed_textured.stages[0].alpha_arg1 = 2u;
+    fixed_textured.stages[0].alpha_arg2 = 0u;
+    fixed_textured.stages[1].color_op = 1u;
+    fixed_textured.stages[1].alpha_op = 1u;
+
+    RecompD3dPixelProgram fixed_untextured{};
+    fixed_untextured.kind = RECOMP_D3D_PIXEL_FIXED_STAGES;
+    fixed_untextured.stages[0].sampled = false;
+    fixed_untextured.stages[0].color_op = 2u;
+    fixed_untextured.stages[0].color_arg1 = 0u;
+    fixed_untextured.stages[0].alpha_op = 2u;
+    fixed_untextured.stages[0].alpha_arg1 = 0u;
+    fixed_untextured.stages[1].color_op = 1u;
+    fixed_untextured.stages[1].alpha_op = 1u;
+
+    static constexpr uint32_t kSc2CommonFixedFvfs[] = {0x042u, 0x044u, 0x104u, 0x142u, 0x144u, 0x152u};
+    for (const uint32_t fvf : kSc2CommonFixedFvfs) {
+        if (presenter->precompile_stop.load()) return;
+        const bool has_uv = (fvf & 0xf00u) != 0u;
+        const RecompD3dDrawShaderKey key{
+            fvf, 0u, nullptr, false, false, false,
+            has_uv ? &fixed_textured : &fixed_untextured
+        };
+        compiled += lookupShaders(presenter, key, false).vertex != nullptr;
+    }
+
     for (const uint32_t fvf : kRecompD3dBootDrawFvfs) {
         if (presenter->precompile_stop.load()) return;
         const RecompD3dDrawShaderKey key{fvf, 0u, nullptr, false, false, false};
         compiled += lookupShaders(presenter, key, false).vertex != nullptr;
     }
-    static constexpr uint32_t kSc2ExtraBootFvfs[] = {0x152u, 0x154u, 0x158u};
+    static constexpr uint32_t kSc2ExtraBootFvfs[] = {0x152u, 0x158u};
     for (const uint32_t fvf : kSc2ExtraBootFvfs) {
         if (presenter->precompile_stop.load()) return;
         const RecompD3dDrawShaderKey key{fvf, 0u, nullptr, false, false, false};
@@ -1462,7 +1503,6 @@ void precompileDrawShaders(RecompD3dPresenter *presenter)
     std::fprintf(stderr, "recomp d3d presenter: precompiled %u draw shaders in %lld ms\n", compiled,
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count()));
-    precompileSavedPipelines(presenter);
 }
 
 SDL_GPUBlendFactor hostBlendFactor(RecompD3dBlendFactor factor, bool alpha_channel)

@@ -251,6 +251,26 @@ static void reportCrashes()
     for (int signal : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(signal, &action, nullptr);
 }
 
+static void sc2_android_on_exit()
+{
+    std::fflush(stdout);
+    std::fflush(stderr);
+    JNIEnv *env = static_cast<JNIEnv *>(SDL_GetAndroidJNIEnv());
+    if (!env) return;
+    jobject activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (!activity) return;
+    jclass activity_class = env->GetObjectClass(activity);
+    if (activity_class) {
+        jmethodID finish_game = env->GetMethodID(activity_class, "finishGame", "(I)V");
+        if (finish_game) {
+            env->CallVoidMethod(activity, finish_game, 0);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(activity_class);
+    }
+    env->DeleteLocalRef(activity);
+}
+
 void sc2_android_start()
 {
     SDL_SetAssertionHandler(passAssertion, nullptr);
@@ -274,10 +294,11 @@ void sc2_android_start()
         dup2(file, 2);
         close(file);
         setvbuf(stdout, nullptr, _IOLBF, 0);
-        setvbuf(stderr, nullptr, _IOFBF, 65536);
+        setvbuf(stderr, nullptr, _IOLBF, 0);
     } else {
         toSystemLog();
     }
+    std::atexit(sc2_android_on_exit);
     reportCrashes();
     // Leave process startup affinity unrestricted so background threads (recomp_host_pump,
     // AAudio, Vulkan driver workers, shader precompile) can be scheduled across all cores
@@ -307,7 +328,7 @@ extern "C" void sc2_android_frame(void)
             applyCoreAffinity(true);
         }
         last_affinity_check = now;
-    } else if (!pinned_fastest && now - last_affinity_check >= 2000000000ull) {
+    } else if (!pinned_fastest && now - last_affinity_check >= 10000000000ull) {
         last_affinity_check = now;
         applyCoreAffinity(false);
     }

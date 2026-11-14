@@ -106,13 +106,21 @@ void testCpuAffinity()
     const auto c1 = sc2::SelectActiveCores(unthrottled);
     CHECK((c1 == std::vector<int>{6, 7}));
 
-    // Case 2: 2+6 SoC when BIG cluster thermally throttles (2.30 GHz hardware throttled to 1.21 GHz scaling_max_freq)
-    // -> stays on the 2x out-of-order BIG cores ({6, 7}) instead of evicting to in-order LITTLE cores or oscillating 6/8 <-> 8/8.
+    // Case 2a: 2+6 SoC when BIG cluster moderately throttles (2.30 GHz -> 1.56 GHz >= 80% of 1.80 GHz)
+    // -> stays strictly on the 2x out-of-order BIG cores ({6, 7}).
+    std::vector<sc2::CpuFreqInfo> mod_throttled = unthrottled;
+    mod_throttled[6].scaling_max_khz = 1560000;
+    mod_throttled[7].scaling_max_khz = 1560000;
+    const auto c2a = sc2::SelectActiveCores(mod_throttled);
+    CHECK((c2a == std::vector<int>{6, 7}));
+
+    // Case 2b: 2+6 SoC when BIG cluster severely throttles (2.30 GHz -> 1.21 GHz < 80% of 1.80 GHz)
+    // -> keeps both BIG cores ({6, 7}) and adds top 2 LITTLE cores ({4, 5, 6, 7}) to relieve thermal cap.
     std::vector<sc2::CpuFreqInfo> throttled = unthrottled;
     throttled[6].scaling_max_khz = 1209600;
     throttled[7].scaling_max_khz = 1209600;
     const auto c2 = sc2::SelectActiveCores(throttled);
-    CHECK((c2 == std::vector<int>{6, 7}));
+    CHECK((c2 == std::vector<int>{4, 5, 6, 7}));
 
     // Case 3: Flagship 1x 2.8 GHz + 3x 2.4 GHz + 4x 1.8 GHz -> picks 4 fast cores, skips slow 4x 1.8 GHz.
     std::vector<sc2::CpuFreqInfo> flagship = {
