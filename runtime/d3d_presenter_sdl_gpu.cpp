@@ -1542,7 +1542,7 @@ SDL_GPUGraphicsPipeline *buildGraphicsPipeline(RecompD3dPresenter *presenter,
     }
     info.depth_stencil_state.enable_depth_test = key.depth_test;
     info.depth_stencil_state.enable_depth_write = key.depth_write;
-    info.depth_stencil_state.compare_op = hostCompareOp(static_cast<RecompD3dCompareOp>(key.depth_func));
+    info.depth_stencil_state.compare_op = hostCompareOp(static_cast<RecompD3dCompareFunc>(key.depth_func));
     info.depth_stencil_state.enable_stencil_test = key.stencil_enable;
     if (key.stencil_enable) {
         info.depth_stencil_state.compare_mask = key.stencil_read;
@@ -1551,7 +1551,7 @@ SDL_GPUGraphicsPipeline *buildGraphicsPipeline(RecompD3dPresenter *presenter,
         face.fail_op = hostStencilOp(static_cast<RecompD3dStencilOp>(key.stencil_fail));
         face.pass_op = hostStencilOp(static_cast<RecompD3dStencilOp>(key.stencil_pass));
         face.depth_fail_op = hostStencilOp(static_cast<RecompD3dStencilOp>(key.stencil_zfail));
-        face.compare_op = hostCompareOp(static_cast<RecompD3dCompareOp>(key.stencil_func));
+        face.compare_op = hostCompareOp(static_cast<RecompD3dCompareFunc>(key.stencil_func));
         info.depth_stencil_state.back_stencil_state = face;
     }
     SDL_GPUColorTargetDescription color{};
