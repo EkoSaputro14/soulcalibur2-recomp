@@ -1291,6 +1291,12 @@ static const char *resolve_and_open(
         /* The image file itself stands for the handle; reads use the entry. */
         *out_host_handle = CreateFileA(recomp_disc_root_path, GENERIC_READ, FILE_SHARE_READ, NULL,
             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+#ifndef _WIN32
+        if (*out_host_handle == INVALID_HANDLE_VALUE) {
+            *out_host_handle = CreateFileA("/dev/null", GENERIC_READ, FILE_SHARE_READ, NULL,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        }
+#endif
         if (*out_host_handle == INVALID_HANDLE_VALUE) {
             *out_status = RECOMP_STATUS_OBJECT_NAME_NOT_FOUND;
             return "image-open-failed";

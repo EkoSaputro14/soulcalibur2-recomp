@@ -144,6 +144,11 @@ public class GameActivity extends SDLActivity {
         return Curl.run(arguments);
     }
 
+    // Opens a SAF content:// URI directly and detaches its native file descriptor for C/C++ pread()/fdopen().
+    public int openContentUri(String uriSpec) {
+        return LauncherActivity.openContentUriDescriptor(this, uriSpec);
+    }
+
     // The game started over in the next process slot with these arguments (online play: a host whose match begins
     // starts afresh, as the program does elsewhere with execv: runtime/runner.cpp startAgain). The new one answers the
     // launcher in this one's place.
@@ -155,6 +160,7 @@ public class GameActivity extends SDLActivity {
         again.putExtra(EXTRA_FOLDER, intent.getStringExtra(EXTRA_FOLDER));
         again.putExtra(EXTRA_LOG, intent.getStringExtra(EXTRA_LOG));
         again.addFlags(Intent.FLAG_ACTIVITY_FORWARD_RESULT);
+        LauncherActivity.attachContentUriGrants(again, arguments);
         // (here, on the game's thread, not later on the activity's: the caller ends the process once this returns)
         try {
             startActivity(again);

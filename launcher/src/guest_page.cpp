@@ -32,6 +32,8 @@
 
 std::mutex g_disc_image_lock;
 
+extern "C" FILE *recomp_open_host_file(const char *path);
+
 namespace {
 
 using layout::Card;
@@ -53,7 +55,7 @@ struct State {
     std::string picked;              // a disc the dialog gave, for the page to take
     int picked_for = 0;
     std::atomic<bool> dialog{false};
-    std::atomic<bool> copying{false};   // (Android: the chosen disc being copied into the app's folder)
+    std::atomic<bool> copying{false};
     std::atomic<bool> building{false};
     std::atomic<int> done{0}, total{1};
     std::string error;               // the last build's, or ""
@@ -77,6 +79,7 @@ bool is_file(const std::filesystem::path &path) {
 
 // The Xbox disc's root.olk: in the image, or beside the Default.xbe
 std::string xbox_source(const std::string &game_file) {
+    if (game_file.rfind("content://", 0) == 0 || game_file.rfind("fd:", 0) == 0) return game_file;
     std::filesystem::path file = std::filesystem::u8path(game_file);
     std::string extension = file.extension().string();
     for (char &c : extension) c = char(std::tolower(static_cast<unsigned char>(c)));
@@ -86,7 +89,7 @@ std::string xbox_source(const std::string &game_file) {
 
 // Which guest a dropped disc is for: a PS2 disc image is ISO 9660 ("CD001" in sector 16), a GameCube one is not
 int guest_of_disc(const std::string &path) {
-    std::FILE *f = std::fopen(path.c_str(), "rb");
+    std::FILE *f = recomp_open_host_file(path.c_str());
     if (!f) return 0;
     char magic[5] = {};
     const bool iso = std::fseek(f, 16 * 2048 + 1, SEEK_SET) == 0 && std::fread(magic, 1, 5, f) == 5 &&
@@ -185,7 +188,6 @@ void choose_disc(launcher::PageContext &page, int guest) {
     s.dialog = true;
     s.picked_for = guest;
 #ifdef __ANDROID__
-    s.copying = true;
     std::thread([folder = page.folder / "guest" / "discs"] {
         const std::string path = import_disc(folder);
         State &st = state();
@@ -246,7 +248,7 @@ void GuestPage(launcher::PageContext &page) {
         const std::string detail = std::string(guest.name) + ": Soulcalibur II (USA) for the " + guest.disc +
             (g == 0 ? ", as a disc image (.iso, .gcm or .ciso)." : ", as a disc image (.iso).") +
 #ifdef __ANDROID__
-            " Choose it: it is copied into the app's folder.";
+            " Choose it: it stays where it is and is only read.";
 #else
             " Drop it on this window or choose it.";
 #endif

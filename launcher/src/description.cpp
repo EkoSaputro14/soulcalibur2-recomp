@@ -25,6 +25,8 @@
 #include <set>
 #include <system_error>
 
+extern "C" FILE *recomp_open_host_file(const char *path);
+
 namespace {
 
 // SHA-256 (FIPS 180-4) of what `read` gives (a count of bytes read into the buffer, 0 at the end), as lowercase hex.
@@ -83,7 +85,7 @@ std::string sha256_of(Read read) {
 
 // ... of a file. Read only, always.
 std::string sha256_of_file(const std::string &path) {
-    std::FILE *file = std::fopen(path.c_str(), "rb");
+    std::FILE *file = recomp_open_host_file(path.c_str());
     if (!file) return {};
     const std::string sum = sha256_of([&](uint8_t *to, size_t size) { return std::fread(to, 1, size, file); });
     std::fclose(file);
@@ -118,6 +120,7 @@ std::string found(const std::string &sum) {
 }
 
 bool is_iso(const std::string &path) {
+    if (path.rfind("content://", 0) == 0 || path.rfind("fd:", 0) == 0) return true;
     std::string extension = std::filesystem::u8path(path).extension().string();
     for (char &c : extension) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return extension == ".iso" || extension == ".xiso";
@@ -129,7 +132,13 @@ launcher::FileCheck check_image(const std::string &path) {
     launcher::FileCheck check;
     std::lock_guard<std::mutex> disc(g_disc_image_lock);   // (the Guest page's build reads images too)
     if (!recomp_disc_image_open(path.c_str())) {
-        check.message = "This isn't an Xbox disc image.";
+        std::FILE *probe = recomp_open_host_file(path.c_str());
+        if (!probe) {
+            check.message = "The disc image can't be opened. Check storage permission or choose it again.";
+        } else {
+            std::fclose(probe);
+            check.message = "This isn't an Xbox disc image.";
+        }
         return check;
     }
     RecompDiscImageEntry xbe;
@@ -244,7 +253,7 @@ const launcher::Description &launcher::describe() {
         d.file_heading = "GAME FILES";
 #ifdef __ANDROID__
         d.file_intro = "Choose your own copy of the game: an image of your Soulcalibur II (USA) Xbox disc (.iso). "
-                       "It is copied into the app's folder, where the game reads it.";
+                       "It stays where it is: the launcher and the game only read it.";
 #else
         d.file_intro = "Choose your own copy of the game: an image of your Soulcalibur II Xbox disc (.iso), USA or Europe, "
                        "or the Default.xbe among the disc's files. It stays where it is: the launcher and the game "

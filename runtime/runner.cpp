@@ -1306,8 +1306,17 @@ int main(int argc, char **argv)
         std::cerr << "recomp runner: invalid heap image boundary\n";
         return 1;
     }
-    if (!discImage.empty()) discRoot = std::filesystem::absolute(std::filesystem::u8path(discImage)).string();
+    const bool directUriDisc = !discImage.empty() &&
+        (discImage.rfind("content://", 0) == 0 || discImage.rfind("fd:", 0) == 0);
+    if (!discImage.empty()) {
+        discRoot = directUriDisc
+            ? "/dev/null"
+            : std::filesystem::absolute(std::filesystem::u8path(discImage)).string();
+    }
     if (discRoot.empty()) discRoot = std::filesystem::absolute(std::filesystem::u8path(xbePath)).parent_path().string();
+    if (directUriDisc && storageRoot.empty()) {
+        storageRoot = (std::filesystem::current_path() / ".recomp-storage").u8string();
+    }
     const auto discPath = std::filesystem::u8path(discRoot);
     std::error_code filesystemError;
     if (discImage.empty() && !std::filesystem::is_directory(discPath, filesystemError)) {

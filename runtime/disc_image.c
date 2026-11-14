@@ -23,6 +23,10 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <unistd.h>
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#include <jni.h>
+#endif
 #endif
 
 /* XDVDFS: 2048-byte sectors. Sector 32 of the game partition is the volume
@@ -357,10 +361,76 @@ bool recomp_disc_image_active(void)
     return image != NULL;
 }
 
+#ifdef __ANDROID__
+static int open_android_content_fd(const char *path)
+{
+    typedef void *(*GetJNIEnvFn)(void);
+    typedef void *(*GetActivityFn)(void);
+    GetJNIEnvFn get_env = (GetJNIEnvFn)dlsym(RTLD_DEFAULT, "SDL_GetAndroidJNIEnv");
+    GetActivityFn get_activity = (GetActivityFn)dlsym(RTLD_DEFAULT, "SDL_GetAndroidActivity");
+    if (get_env == NULL || get_activity == NULL) return -1;
+    JNIEnv *env = (JNIEnv *)get_env();
+    jobject activity = (jobject)get_activity();
+    if (env == NULL || activity == NULL) return -1;
+    jclass cls = (*env)->GetObjectClass(env, activity);
+    int fd = -1;
+    if (cls != NULL) {
+        jmethodID mid = (*env)->GetMethodID(env, cls, "openContentUri", "(Ljava/lang/String;)I");
+        if (mid != NULL) {
+            jstring jpath = (*env)->NewStringUTF(env, path);
+            if (jpath != NULL) {
+                fd = (int)(*env)->CallIntMethod(env, activity, mid, jpath);
+                (*env)->DeleteLocalRef(env, jpath);
+            }
+        }
+        (*env)->DeleteLocalRef(env, cls);
+    }
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        fd = -1;
+    }
+    (*env)->DeleteLocalRef(env, activity);
+    return fd;
+}
+#endif
+
+FILE *recomp_open_host_file(const char *path)
+{
+    if (path == NULL || path[0] == '\0') return NULL;
+#ifndef _WIN32
+#ifdef __ANDROID__
+    if (strncmp(path, "content://", 10) == 0) {
+        int fd = open_android_content_fd(path);
+        if (fd < 0) return NULL;
+        FILE *f = fdopen(fd, "rb");
+        if (f == NULL) {
+            close(fd);
+            return NULL;
+        }
+        return f;
+    }
+#endif
+    if (strncmp(path, "fd:", 3) == 0) {
+        char *end = NULL;
+        long orig_fd = strtol(path + 3, &end, 10);
+        if (end != path + 3 && orig_fd >= 0) {
+            int dup_fd = dup((int)orig_fd);
+            if (dup_fd >= 0) {
+                FILE *f = fdopen(dup_fd, "rb");
+                if (f != NULL) return f;
+                close(dup_fd);
+            }
+        }
+        return NULL;
+    }
+#endif
+    return fopen(path, "rb");
+}
+
 bool recomp_disc_image_open(const char *path)
 {
     recomp_disc_image_close();
-    FILE *file = fopen(path, "rb");
+    FILE *file = recomp_open_host_file(path);
     if (file == NULL) {
         fprintf(stderr, "recomp disc image: can't open %s\n", path);
         return false;

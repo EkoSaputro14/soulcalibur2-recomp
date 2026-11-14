@@ -2,16 +2,20 @@
 // Copyright (C) 2026 Tommy McLeroy. Taken from cps2recomp's android/.
 package io.github.tmcleroy.soulcalibur2;
 
+import android.content.ClipData;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.util.Log;
+import android.widget.Toast;
 
 import org.libsdl.app.SDLActivity;
 
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -21,9 +25,9 @@ import java.util.List;
 // The launcher (libsoulcalibur2-launcher.so: recomp-common's launcher). What a launcher does elsewhere by
 // starting a program, it asks this activity for, from its own thread (recomp-common/launcher/src/game_process.cpp):
 // startGame() starts a game's activity in the next process slot, and gameResult() says how it ended; importFiles()
-// asks the player for a disc image with the system's picker and copies it where the game can open it, and
-// importResult() says where; installPackage() hands a new version's APK, downloaded and checked, to Android's
-// installer (recomp-common/launcher/src/update.cpp).
+// asks the player for a disc image with the system's Storage Access Framework picker and keeps a direct persistable
+// URI reference so the launcher and game read the ISO in place without copying; installPackage() hands a new
+// version's APK, downloaded and checked, to Android's installer (recomp-common/launcher/src/update.cpp).
 public class LauncherActivity extends SDLActivity {
     static final int STILL_RUNNING = Integer.MIN_VALUE;
     private static final Class<?>[] SLOTS = {
@@ -67,16 +71,16 @@ public class LauncherActivity extends SDLActivity {
         if (done.exists()) {
             return;
         }
-        android.widget.Toast.makeText(this, "Unpacking the game files packed in this build (a minute or two); "
-            + "the launcher starts again when done", android.widget.Toast.LENGTH_LONG).show();
+        Toast.makeText(this, "Unpacking the game files packed in this build (a minute or two); "
+            + "the launcher starts again when done", Toast.LENGTH_LONG).show();
         new Thread(() -> {
             try {
-                File imported = new File(home, "imported");
+                File importedDir = new File(home, "imported");
                 File guest = new File(home, "guest");
-                imported.mkdirs();
+                importedDir.mkdirs();
                 guest.mkdirs();
                 for (String name : files) {
-                    File to = new File(name.equals("disc.iso") ? imported : guest, name);
+                    File to = new File(name.equals("disc.iso") ? importedDir : guest, name);
                     File partial = new File(to.getPath() + ".part");
                     try (InputStream in = getAssets().open("game/" + name); OutputStream out = new FileOutputStream(partial)) {
                         byte[] buffer = new byte[1 << 20];
@@ -91,7 +95,7 @@ public class LauncherActivity extends SDLActivity {
                 File ini = new File(home, "launcher.ini");
                 String text = ini.exists() ? new String(java.nio.file.Files.readAllBytes(ini.toPath()),
                     java.nio.charset.StandardCharsets.UTF_8) : "";
-                String disc = "disc=" + new File(imported, "disc.iso").getPath();
+                String disc = "disc=" + new File(importedDir, "disc.iso").getPath();
                 StringBuilder out = new StringBuilder();
                 boolean inGame = false, written = false;
                 for (String line : text.split("\n", -1)) {
@@ -145,9 +149,72 @@ public class LauncherActivity extends SDLActivity {
         intent.putExtra(GameActivity.EXTRA_ARGUMENTS, arguments);
         intent.putExtra(GameActivity.EXTRA_FOLDER, folder);
         intent.putExtra(GameActivity.EXTRA_LOG, log);
+        attachContentUriGrants(intent, arguments);
         result = STILL_RUNNING;
         runOnUiThread(() -> startActivityForResult(intent, REQUEST_GAME));
         return true;
+    }
+
+    static void attachContentUriGrants(Intent intent, String[] arguments) {
+        if (arguments == null) {
+            return;
+        }
+        ClipData clip = null;
+        for (String arg : arguments) {
+            if (arg != null && arg.startsWith("content://")) {
+                Uri uri = Uri.parse(stripDisplayFragment(arg));
+                if (clip == null) {
+                    clip = ClipData.newRawUri("disc", uri);
+                } else {
+                    clip.addItem(new ClipData.Item(uri));
+                }
+            }
+        }
+        if (clip != null) {
+            intent.setClipData(clip);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        }
+    }
+
+    static String stripDisplayFragment(String uriSpec) {
+        if (uriSpec == null) {
+            return "";
+        }
+        int hash = uriSpec.indexOf("#/");
+        if (hash < 0) {
+            hash = uriSpec.indexOf('#');
+        }
+        return hash >= 0 ? uriSpec.substring(0, hash) : uriSpec;
+    }
+
+    // Opens a SAF content:// URI directly and detaches its native file descriptor for C/C++ pread()/fdopen().
+    public int openContentUri(String uriSpec) {
+        return openContentUriDescriptor(this, uriSpec);
+    }
+
+    static int openContentUriDescriptor(android.content.Context context, String uriSpec) {
+        if (uriSpec == null || uriSpec.isEmpty()) {
+            return -1;
+        }
+        String clean = stripDisplayFragment(uriSpec);
+        try {
+            Uri uri = Uri.parse(clean);
+            ParcelFileDescriptor pfd = context.getContentResolver().openFileDescriptor(uri, "r");
+            if (pfd == null) {
+                Log.w("soulcalibur2", "openContentUri: null ParcelFileDescriptor for " + clean);
+                return -1;
+            }
+            return pfd.detachFd();
+        } catch (SecurityException e) {
+            Log.e("soulcalibur2", "openContentUri permission denied for " + clean + ": " + e);
+            return -1;
+        } catch (FileNotFoundException e) {
+            Log.e("soulcalibur2", "openContentUri file not found for " + clean + ": " + e);
+            return -1;
+        } catch (Exception e) {
+            Log.e("soulcalibur2", "openContentUri failed for " + clean + ": " + e);
+            return -1;
+        }
     }
 
     // An HTTP request, from curl's arguments (recomp-common/launcher/src/run_program.cpp): Curl.java
@@ -202,7 +269,8 @@ public class LauncherActivity extends SDLActivity {
         return result;
     }
 
-    // The system's picker for files (several if `many`), each chosen copied into `folder` by its own name
+    // Opens the Android Storage Access Framework (SAF) document picker so the player can choose an ISO directly
+    // from any directory on the device without copying it into app storage.
     public void importFiles(String folder, boolean many) {
         importFolder = folder;
         imported = null;
@@ -210,10 +278,19 @@ public class LauncherActivity extends SDLActivity {
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, many);
-        runOnUiThread(() -> startActivityForResult(intent, REQUEST_IMPORT));
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+            | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        runOnUiThread(() -> {
+            try {
+                startActivityForResult(intent, REQUEST_IMPORT);
+            } catch (Exception e) {
+                Log.e("soulcalibur2", "could not open document picker: " + e);
+                imported = "";
+            }
+        });
     }
 
-    // The copies' paths, one a line ("" for none), or null while the player chooses and they are copied
+    // The chosen direct URI references, one per line ("" for none), or null while the player is choosing
     public String importResult() {
         return imported;
     }
@@ -232,22 +309,25 @@ public class LauncherActivity extends SDLActivity {
             result = resultCode >= RESULT_FIRST_USER ? resultCode - RESULT_FIRST_USER : -1;
         } else if (requestCode == REQUEST_IMPORT) {
             final List<Uri> chosen = new ArrayList<>();
+            final int flags = data != null ? data.getFlags() : 0;
             if (resultCode == RESULT_OK && data != null) {
                 if (data.getClipData() != null) {
                     for (int i = 0; i < data.getClipData().getItemCount(); i++) {
-                        chosen.add(data.getClipData().getItemAt(i).getUri());
+                        Uri itemUri = data.getClipData().getItemAt(i).getUri();
+                        if (itemUri != null) {
+                            chosen.add(itemUri);
+                        }
                     }
                 } else if (data.getData() != null) {
                     chosen.add(data.getData());
                 }
             }
-            // (a disc image is gigabytes: copied away from the activity's thread)
             new Thread(() -> {
                 StringBuilder paths = new StringBuilder();
                 for (Uri uri : chosen) {
-                    String path = copy(uri, importFolder);
-                    if (path != null) {
-                        paths.append(path).append('\n');
+                    String directUri = resolveDirectUri(uri, flags);
+                    if (directUri != null) {
+                        paths.append(directUri).append('\n');
                     }
                 }
                 imported = paths.toString();
@@ -255,33 +335,72 @@ public class LauncherActivity extends SDLActivity {
         }
     }
 
-    // A document copied into a folder by its own name; its path there, or null
-    private String copy(Uri uri, String folder) {
+    private void showErrorToast(final String message) {
+        runOnUiThread(() -> Toast.makeText(this, message, Toast.LENGTH_LONG).show());
+    }
+
+    // Persists read permission on the chosen SAF document URI, verifies it can be opened directly via
+    // ParcelFileDescriptor without copying any data, and appends #/<displayName> so native path utilities see the
+    // original filename and extension.
+    private String resolveDirectUri(Uri uri, int grantFlags) {
+        if (uri == null) {
+            return null;
+        }
+        final int takeFlags = (grantFlags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0
+            ? (grantFlags & Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            : Intent.FLAG_GRANT_READ_URI_PERMISSION;
+        try {
+            getContentResolver().takePersistableUriPermission(uri, takeFlags);
+        } catch (SecurityException e) {
+            Log.w("soulcalibur2", "persistable URI permission not supported by provider for " + uri + ": " + e);
+        } catch (Exception e) {
+            Log.w("soulcalibur2", "takePersistableUriPermission warning for " + uri + ": " + e);
+        }
+
+        try (ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "r")) {
+            if (pfd == null) {
+                Log.e("soulcalibur2", "cannot open file descriptor for " + uri);
+                showErrorToast("Cannot read the selected ISO file.");
+                return null;
+            }
+            long size = pfd.getStatSize();
+            if (size == 0) {
+                Log.e("soulcalibur2", "selected file is empty: " + uri);
+                showErrorToast("The selected file is empty.");
+                return null;
+            }
+        } catch (SecurityException e) {
+            Log.e("soulcalibur2", "permission denied opening " + uri + ": " + e);
+            showErrorToast("Permission denied to read the selected ISO file.");
+            return null;
+        } catch (FileNotFoundException e) {
+            Log.e("soulcalibur2", "file not found for " + uri + ": " + e);
+            showErrorToast("The selected ISO file could not be found.");
+            return null;
+        } catch (Exception e) {
+            Log.e("soulcalibur2", "failed to inspect " + uri + ": " + e);
+            showErrorToast("Failed to open the selected ISO file.");
+            return null;
+        }
+
         String name = null;
         try (Cursor cursor = getContentResolver().query(uri, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
                 name = cursor.getString(0);
             }
         } catch (Exception e) {
-            Log.w("soulcalibur2", "no name for " + uri + ": " + e);
+            Log.w("soulcalibur2", "no display name for " + uri + ": " + e);
         }
         if (name == null || name.isEmpty()) {
             name = uri.getLastPathSegment();
         }
-        name = new File(name).getName();  // (never a path)
-        File to = new File(folder, name);
-        File partial = new File(folder, name + ".part");
-        try (InputStream in = getContentResolver().openInputStream(uri); OutputStream out = new FileOutputStream(partial)) {
-            byte[] buffer = new byte[1 << 16];
-            for (int got; (got = in.read(buffer)) > 0;) {
-                out.write(buffer, 0, got);
-            }
-        } catch (Exception e) {
-            Log.w("soulcalibur2", "could not copy " + uri + ": " + e);
-            partial.delete();
-            return null;
+        if (name == null || name.isEmpty()) {
+            name = "disc.iso";
         }
-        to.delete();
-        return partial.renameTo(to) ? to.getPath() : null;
+        name = new File(name).getName();
+        if (name.isEmpty()) {
+            name = "disc.iso";
+        }
+        return uri.toString() + "#/" + name;
     }
 }

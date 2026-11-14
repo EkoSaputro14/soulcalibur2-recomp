@@ -12,6 +12,7 @@
 
 extern "C" {
 #include "disc_image.h"
+FILE *recomp_open_host_file(const char *path);
 }
 
 #include <algorithm>
@@ -26,7 +27,7 @@ namespace {
 struct File {
     std::FILE *f = nullptr;
     std::mutex lock;
-    explicit File(const std::string &path) : f(std::fopen(path.c_str(), "rb"))
+    explicit File(const std::string &path) : f(recomp_open_host_file(path.c_str()))
     {
         if (!f) throw Error("cannot open " + path);
     }
