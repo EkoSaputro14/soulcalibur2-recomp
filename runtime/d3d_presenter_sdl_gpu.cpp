@@ -1453,30 +1453,36 @@ void precompileDrawShaders(RecompD3dPresenter *presenter)
     const auto start = std::chrono::steady_clock::now();
     unsigned compiled = 0u;
 
-    // Soulcalibur II routes non-point draws through general_fixed_stages (RECOMP_D3D_PIXEL_FIXED_STAGES).
-    // Precompile the common textured (MODULATE texture * diffuse) and untextured (SELECTARG1 diffuse)
-    // fixed-stage pixel programs alongside the base boot FVFs.
+    // Soulcalibur II routes non-point draws through general_fixed_stages (RECOMP_D3D_PIXEL_FIXED_FUNCTION).
+    // Precompile the common textured (MODULATE texture * current/diffuse) and untextured (SELECTARG1 diffuse)
+    // fixed-function pixel programs alongside the base boot FVFs.
     RecompD3dPixelProgram fixed_textured{};
-    fixed_textured.kind = RECOMP_D3D_PIXEL_FIXED_STAGES;
+    fixed_textured.kind = RECOMP_D3D_PIXEL_FIXED_FUNCTION;
+    fixed_textured.stage_count = 1u;
     fixed_textured.stages[0].sampled = true;
-    fixed_textured.stages[0].color_op = 4u;
-    fixed_textured.stages[0].color_arg1 = 2u;
-    fixed_textured.stages[0].color_arg2 = 0u;
-    fixed_textured.stages[0].alpha_op = 4u;
-    fixed_textured.stages[0].alpha_arg1 = 2u;
-    fixed_textured.stages[0].alpha_arg2 = 0u;
-    fixed_textured.stages[1].color_op = 1u;
-    fixed_textured.stages[1].alpha_op = 1u;
+    fixed_textured.stages[0].color_op = RECOMP_D3DTOP_MODULATE;
+    fixed_textured.stages[0].color_arg[0] = RECOMP_D3DTA_CURRENT;
+    fixed_textured.stages[0].color_arg[1] = RECOMP_D3DTA_TEXTURE;
+    fixed_textured.stages[0].color_arg[2] = RECOMP_D3DTA_DIFFUSE;
+    fixed_textured.stages[0].alpha_op = RECOMP_D3DTOP_MODULATE;
+    fixed_textured.stages[0].alpha_arg[0] = RECOMP_D3DTA_CURRENT;
+    fixed_textured.stages[0].alpha_arg[1] = RECOMP_D3DTA_TEXTURE;
+    fixed_textured.stages[0].alpha_arg[2] = RECOMP_D3DTA_DIFFUSE;
+    fixed_textured.stages[0].result_arg = RECOMP_D3DTA_CURRENT;
 
     RecompD3dPixelProgram fixed_untextured{};
-    fixed_untextured.kind = RECOMP_D3D_PIXEL_FIXED_STAGES;
+    fixed_untextured.kind = RECOMP_D3D_PIXEL_FIXED_FUNCTION;
+    fixed_untextured.stage_count = 1u;
     fixed_untextured.stages[0].sampled = false;
-    fixed_untextured.stages[0].color_op = 2u;
-    fixed_untextured.stages[0].color_arg1 = 0u;
-    fixed_untextured.stages[0].alpha_op = 2u;
-    fixed_untextured.stages[0].alpha_arg1 = 0u;
-    fixed_untextured.stages[1].color_op = 1u;
-    fixed_untextured.stages[1].alpha_op = 1u;
+    fixed_untextured.stages[0].color_op = RECOMP_D3DTOP_SELECTARG1;
+    fixed_untextured.stages[0].color_arg[0] = RECOMP_D3DTA_CURRENT;
+    fixed_untextured.stages[0].color_arg[1] = RECOMP_D3DTA_DIFFUSE;
+    fixed_untextured.stages[0].color_arg[2] = RECOMP_D3DTA_CURRENT;
+    fixed_untextured.stages[0].alpha_op = RECOMP_D3DTOP_SELECTARG1;
+    fixed_untextured.stages[0].alpha_arg[0] = RECOMP_D3DTA_CURRENT;
+    fixed_untextured.stages[0].alpha_arg[1] = RECOMP_D3DTA_DIFFUSE;
+    fixed_untextured.stages[0].alpha_arg[2] = RECOMP_D3DTA_CURRENT;
+    fixed_untextured.stages[0].result_arg = RECOMP_D3DTA_CURRENT;
 
     static constexpr uint32_t kSc2CommonFixedFvfs[] = {0x042u, 0x044u, 0x104u, 0x142u, 0x144u, 0x152u};
     for (const uint32_t fvf : kSc2CommonFixedFvfs) {
