@@ -164,6 +164,7 @@ struct TextureEntry {
     uint64_t fingerprint = 0u;
     uint64_t last_used = 0u;
     uint64_t last_segment_id = 0u;
+    uint32_t verified_present = UINT32_MAX;
     SDL_GPUTexture *texture = nullptr;
 };
 
@@ -390,6 +391,21 @@ struct RecompD3dPresenter {
     std::mutex pipeline_file_lock;
     std::unordered_map<ShaderKey, ShaderPair, ShaderKeyHash, ShaderKeyEqual> shaders;
     std::unordered_map<PipelineKey, SDL_GPUGraphicsPipeline *, PipelineKeyHash, PipelineKeyEqual> pipelines;
+    static constexpr uint32_t kShaderInlineSlots = 32u;
+    static constexpr uint32_t kPipelineInlineSlots = 64u;
+    struct ShaderInlineEntry {
+        uint64_t hash = 0u;
+        ShaderKey key{};
+        ShaderPair pair{};
+        bool valid = false;
+    };
+    struct PipelineInlineEntry {
+        uint64_t hash = 0u;
+        PipelineKey key{};
+        SDL_GPUGraphicsPipeline *pipeline = nullptr;
+    };
+    ShaderInlineEntry shader_inline_cache[kShaderInlineSlots]{};
+    PipelineInlineEntry pipeline_inline_cache[kPipelineInlineSlots]{};
     std::unordered_set<uint64_t> saved_pipeline_hashes;
     std::thread precompile;
     std::atomic<bool> precompile_stop{false};
@@ -592,6 +608,7 @@ void dropTextures(RecompD3dPresenter *presenter)
         entry.used = false;
         entry.last_used = 0u;
         entry.last_segment_id = 0u;
+        entry.verified_present = UINT32_MAX;
     }
     std::fill(std::begin(presenter->texture_used), std::end(presenter->texture_used), false);
     std::fill(std::begin(presenter->texture_last_used), std::end(presenter->texture_last_used), 0u);
@@ -1149,9 +1166,10 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const TextureLookup
     }
     const auto cached = presenter->texture_index.equal_range(desc.data);
     const bool fingerprinted = !linear_bgra && req.texture_bytes != nullptr;
-    const uint64_t fingerprint = linear_bgra
+    bool have_fingerprint = !fingerprinted;
+    uint64_t fingerprint = linear_bgra
         ? sc2::HashLinearBgraRows(req.texture_bytes, desc.width * 4u, desc.height, desc.pitch)
-        : (fingerprinted ? textureFingerprint(req.texture_bytes, req.texture_byte_count) : 0u);
+        : 0u;
     for (auto it = cached.first; it != cached.second; ++it) {
         const uint32_t slot = it->second;
         TextureEntry &entry = presenter->textures[slot];
@@ -1159,22 +1177,31 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const TextureLookup
             entry.height == desc.height && entry.volume_depth == desc.volume_depth &&
             entry.mip_levels == levels &&
             (!palettized || std::memcmp(entry.palette, req.palette_bytes, kPaletteBytes) == 0)) {
-            if (fingerprinted && entry.fingerprint != fingerprint) {
-                static unsigned reported;
-                if (reported < 32u) {
-                    ++reported;
-                    std::fprintf(stderr, "recomp d3d presenter: texels changed data=0x%08X "
-                        "fmt=0x%02X size=%ux%u\n", desc.data, desc.format_byte, desc.width, desc.height);
+            if (fingerprinted) {
+                if (entry.verified_present != presenter->present_count) {
+                    if (!have_fingerprint) {
+                        fingerprint = textureFingerprint(req.texture_bytes, req.texture_byte_count);
+                        have_fingerprint = true;
+                    }
+                    if (entry.fingerprint != fingerprint) {
+                        static unsigned reported;
+                        if (reported < 32u) {
+                            ++reported;
+                            std::fprintf(stderr, "recomp d3d presenter: texels changed data=0x%08X "
+                                "fmt=0x%02X size=%ux%u\n", desc.data, desc.format_byte, desc.width, desc.height);
+                        }
+                        unindexTexture(presenter, slot);
+                        retireTexture(presenter, entry.texture);
+                        entry.used = false;
+                        entry.last_used = 0u;
+                        entry.verified_present = UINT32_MAX;
+                        presenter->texture_used[slot] = false;
+                        presenter->texture_last_used[slot] = 0u;
+                        break;
+                    }
+                    entry.verified_present = presenter->present_count;
                 }
-                unindexTexture(presenter, slot);
-                retireTexture(presenter, entry.texture);
-                entry.used = false;
-                entry.last_used = 0u;
-                presenter->texture_used[slot] = false;
-                presenter->texture_last_used[slot] = 0u;
-                break;
-            }
-            if (linear_bgra && entry.fingerprint != fingerprint) {
+            } else if (linear_bgra && entry.fingerprint != fingerprint) {
                 // Only flush if an already-queued draw in THIS segment sampled this texture.
                 if (sc2::ShouldFlushLinearBgraUpdate(entry.last_segment_id, presenter->segment_id,
                         !presenter->segment.draws.empty())) {
@@ -1201,6 +1228,9 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const TextureLookup
             presenter->texture_last_used[slot] = entry.last_used;
             return entry.texture;
         }
+    }
+    if (!have_fingerprint) {
+        fingerprint = textureFingerprint(req.texture_bytes, req.texture_byte_count);
     }
     /* A texture pack's image in its place, or this one dumped for making one (d3d_texture_replace.h) */
     SDL_GPUTexture *replaced = nullptr;
@@ -1333,6 +1363,7 @@ SDL_GPUTexture *lookupTexture(RecompD3dPresenter *presenter, const TextureLookup
     entry.fingerprint = fingerprint;
     entry.last_used = ++presenter->texture_use_clock;
     entry.last_segment_id = presenter->segment_id;
+    entry.verified_present = fingerprinted ? presenter->present_count : UINT32_MAX;
     entry.texture = texture;
     presenter->texture_used[slot] = true;
     presenter->texture_last_used[slot] = entry.last_used;
@@ -1386,10 +1417,28 @@ ShaderPair lookupShaders(RecompD3dPresenter *presenter, const RecompD3dDrawShade
     key.sample_depth_bias = draw_key.sample_depth_bias;
     key.count_pass = count_pass;
     key.samples = draw_key.sample_depth_bias ? presenter->msaa_count : 0u;
+    const bool on_owner = std::this_thread::get_id() == presenter->owner_thread;
+    const uint64_t inline_hash = on_owner ? hashBytes(&key, sizeof key) : 0u;
+    RecompD3dPresenter::ShaderInlineEntry *inline_slot = nullptr;
+    if (on_owner) {
+        inline_slot = &presenter->shader_inline_cache[inline_hash & (RecompD3dPresenter::kShaderInlineSlots - 1u)];
+        if (inline_slot->valid && inline_slot->hash == inline_hash &&
+            std::memcmp(&inline_slot->key, &key, sizeof key) == 0) {
+            return inline_slot->pair;
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(presenter->shader_lock);
         const auto found = presenter->shaders.find(key);
-        if (found != presenter->shaders.end()) return found->second;
+        if (found != presenter->shaders.end()) {
+            if (inline_slot != nullptr && found->second.vertex != nullptr) {
+                inline_slot->hash = inline_hash;
+                inline_slot->key = key;
+                inline_slot->pair = found->second;
+                inline_slot->valid = true;
+            }
+            return found->second;
+        }
     }
     const auto start = std::chrono::steady_clock::now();
     ShaderPair pair;
@@ -1953,10 +2002,28 @@ SDL_GPUGraphicsPipeline *lookupPipeline(RecompD3dPresenter *presenter, const Pip
         }
     }
 
+    const bool on_owner = std::this_thread::get_id() == presenter->owner_thread;
+    const uint64_t inline_hash = on_owner ? hashBytes(&key, sizeof key) : 0u;
+    RecompD3dPresenter::PipelineInlineEntry *inline_slot = nullptr;
+    if (on_owner) {
+        inline_slot = &presenter->pipeline_inline_cache[inline_hash & (RecompD3dPresenter::kPipelineInlineSlots - 1u)];
+        if (inline_slot->pipeline != nullptr && inline_slot->hash == inline_hash &&
+            std::memcmp(&inline_slot->key, &key, sizeof key) == 0) {
+            return inline_slot->pipeline;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(presenter->pipeline_lock);
         const auto found = presenter->pipelines.find(key);
-        if (found != presenter->pipelines.end()) return found->second;
+        if (found != presenter->pipelines.end()) {
+            if (inline_slot != nullptr && found->second != nullptr) {
+                inline_slot->hash = inline_hash;
+                inline_slot->key = key;
+                inline_slot->pipeline = found->second;
+            }
+            return found->second;
+        }
     }
 
     const auto start = std::chrono::steady_clock::now();
@@ -1970,6 +2037,11 @@ SDL_GPUGraphicsPipeline *lookupPipeline(RecompD3dPresenter *presenter, const Pip
         const auto inserted = presenter->pipelines.emplace(key, pipeline);
         if (!inserted.second) {
             if (pipeline != nullptr) SDL_ReleaseGPUGraphicsPipeline(presenter->device, pipeline);
+            if (inline_slot != nullptr && inserted.first->second != nullptr) {
+                inline_slot->hash = inline_hash;
+                inline_slot->key = key;
+                inline_slot->pipeline = inserted.first->second;
+            }
             return inserted.first->second;
         }
         cached_count = presenter->pipelines.size();
@@ -1983,6 +2055,11 @@ SDL_GPUGraphicsPipeline *lookupPipeline(RecompD3dPresenter *presenter, const Pip
         std::fprintf(stderr, "recomp d3d presenter: draw pipeline fvf=0x%08X failed: %s\n",
             state.fvf, SDL_GetError());
     } else {
+        if (inline_slot != nullptr) {
+            inline_slot->hash = inline_hash;
+            inline_slot->key = key;
+            inline_slot->pipeline = pipeline;
+        }
         const bool scaled_bias = state.samples > SDL_GPU_SAMPLECOUNT_1 && state.slope_bias == 0.0f &&
             draw.slope_scaled_depth_bias != 0.0f;
         const bool sample_bias = scaled_bias && state.samples > SDL_GPU_SAMPLECOUNT_1;
@@ -4113,6 +4190,7 @@ RecompD3dPresenterError d3d_backend_release_memory(
             retireTexture(presenter, entry.texture);
             entry.used = false;
             entry.last_used = 0u;
+            entry.verified_present = UINT32_MAX;
             presenter->texture_used[i] = false;
             presenter->texture_last_used[i] = 0u;
         }

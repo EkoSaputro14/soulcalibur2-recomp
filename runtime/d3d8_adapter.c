@@ -61,6 +61,18 @@ enum { VISIBILITY_TESTS = 64u * 256u, D3DERR_TESTINCOMPLETE = 0x88760828u };
 static bool visibility_open;
 /* Guest samples per counted host pixel for each ended index; zero until ended. */
 static uint32_t visibility_scale[VISIBILITY_TESTS];
+static struct {
+    bool valid;
+    uint32_t color_addr;
+    uint32_t depth_addr;
+    uint32_t scale[2];
+    RecompD3dSurfaceHeader color_hdr;
+    RecompD3dSurfaceHeader depth_hdr;
+    RecompD3dSurfaceHeader main0_hdr;
+    RecompD3dSurfaceHeader main1_hdr;
+    RecompD3dSurfaceHeader main_depth_hdr;
+    RecompD3dPresenterTarget target;
+} target_cache;
 
 static uint32_t argument(uint32_t entry, uint32_t index)
 {
@@ -169,6 +181,7 @@ void recomp_d3d8_shutdown(void)
     back_buffer_displayed = back_buffer_saved = false;
     display_mode_pending = false;
     visibility_open = false;
+    target_cache.valid = false;
     memset(visibility_scale, 0, sizeof visibility_scale);
 }
 
@@ -275,7 +288,51 @@ uint32_t recomp_d3d8_main_depth_data(void)
 void recomp_d3d8_target(RecompD3dPresenterTarget *target)
 {
     recomp_d3d8_require_device();
-    resolve_target(*recomp_memory_u32(DEVICE + TARGET), *recomp_memory_u32(DEVICE + DEPTH), target);
+    const uint32_t color_addr = *recomp_memory_u32(DEVICE + TARGET);
+    const uint32_t depth_addr = *recomp_memory_u32(DEVICE + DEPTH);
+    if (color_addr == 0u) {
+        resolve_target(color_addr, depth_addr, target);
+        return;
+    }
+    const uint32_t main0_addr = color_header(0u);
+    const uint32_t main1_addr = color_header(1u);
+    const uint32_t main_depth_addr = DEVICE + DEPTH_HEADER;
+    const uint8_t *color_bytes = recomp_memory(color_addr, sizeof(RecompD3dSurfaceHeader));
+    const uint8_t *main0_bytes = recomp_memory(main0_addr, sizeof(RecompD3dSurfaceHeader));
+    const uint8_t *main1_bytes = recomp_memory(main1_addr, sizeof(RecompD3dSurfaceHeader));
+    const uint8_t *depth_bytes = depth_addr != 0u ? recomp_memory(depth_addr, sizeof(RecompD3dSurfaceHeader)) : NULL;
+    const uint8_t *main_depth_bytes = depth_addr != 0u
+        ? recomp_memory(main_depth_addr, sizeof(RecompD3dSurfaceHeader)) : NULL;
+
+    if (target_cache.valid &&
+        target_cache.color_addr == color_addr &&
+        target_cache.depth_addr == depth_addr &&
+        target_cache.scale[0] == device_state.scale[0] &&
+        target_cache.scale[1] == device_state.scale[1] &&
+        memcmp(color_bytes, &target_cache.color_hdr, sizeof(RecompD3dSurfaceHeader)) == 0 &&
+        memcmp(main0_bytes, &target_cache.main0_hdr, sizeof(RecompD3dSurfaceHeader)) == 0 &&
+        memcmp(main1_bytes, &target_cache.main1_hdr, sizeof(RecompD3dSurfaceHeader)) == 0 &&
+        (depth_addr == 0u ||
+            (memcmp(depth_bytes, &target_cache.depth_hdr, sizeof(RecompD3dSurfaceHeader)) == 0 &&
+             memcmp(main_depth_bytes, &target_cache.main_depth_hdr, sizeof(RecompD3dSurfaceHeader)) == 0))) {
+        *target = target_cache.target;
+        return;
+    }
+
+    resolve_target(color_addr, depth_addr, target);
+    target_cache.color_addr = color_addr;
+    target_cache.depth_addr = depth_addr;
+    target_cache.scale[0] = device_state.scale[0];
+    target_cache.scale[1] = device_state.scale[1];
+    memcpy(&target_cache.color_hdr, color_bytes, sizeof(RecompD3dSurfaceHeader));
+    memcpy(&target_cache.main0_hdr, main0_bytes, sizeof(RecompD3dSurfaceHeader));
+    memcpy(&target_cache.main1_hdr, main1_bytes, sizeof(RecompD3dSurfaceHeader));
+    if (depth_addr != 0u) {
+        memcpy(&target_cache.depth_hdr, depth_bytes, sizeof(RecompD3dSurfaceHeader));
+        memcpy(&target_cache.main_depth_hdr, main_depth_bytes, sizeof(RecompD3dSurfaceHeader));
+    }
+    target_cache.target = *target;
+    target_cache.valid = true;
 }
 
 /* D3D_CommonSetMultiSampleModeAndScale (0x347130): only the back buffer
@@ -305,6 +362,7 @@ static void write_frame_buffer_mode(const RecompD3dPresentationParameters *prese
 
 static void write_initial_device(const RecompD3dPresentationParameters *presentation)
 {
+    target_cache.valid = false;
     recomp_d3d8_state_reset();
     memset(recomp_memory(DEVICE, DEVICE_SIZE), 0, DEVICE_SIZE);
     for (uint32_t i = 0; i < 2u; ++i) {

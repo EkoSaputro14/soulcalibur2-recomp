@@ -328,7 +328,7 @@ extern "C" void sc2_android_frame(void)
             applyCoreAffinity(true);
         }
         last_affinity_check = now;
-    } else if (!pinned_fastest && now - last_affinity_check >= 10000000000ull) {
+    } else if (!pinned_fastest && now - last_affinity_check >= 3000000000ull) {
         last_affinity_check = now;
         applyCoreAffinity(false);
     }
@@ -336,22 +336,28 @@ extern "C" void sc2_android_frame(void)
         const unsigned long long gaps = recomp_audio_output_underruns();
         RecompD3dPresenterPerf perf{};
         recomp_d3d_presenter_take_perf(&perf);
+        const uint64_t prep_ns = sc2_d3d8_take_draw_prep_ns != nullptr ? sc2_d3d8_take_draw_prep_ns() : 0ull;
         const double vblank_now = recomp_d3d_vblank_wait_ms;
         const double vblank_ms = std::max(0.0, vblank_now - vblank_before);
         vblank_before = vblank_now;
         const double denom = frames > 0u ? static_cast<double>(frames) : 1.0;
+        const double elapsed_ms = double(now - window_start) / 1e6;
+        const double frame_ms = elapsed_ms / denom;
+        const double prep_ms = (prep_ns / 1e6) / denom;
+        const double draw_ms = (perf.draw_ns / 1e6) / denom;
+        const double upload_ms = (perf.upload_ns / 1e6) / denom;
+        const double decode_ms = (perf.tex_decode_ns / 1e6) / denom;
+        const double flush_ms = (perf.flush_ns / 1e6) / denom;
+        const double pres_ms = (perf.present_total_ns / 1e6) / denom;
+        const double wait_ms = (perf.present_wait_ns / 1e6) / denom;
+        const double guest_ms = std::max(0.0, frame_ms - (prep_ms + draw_ms + upload_ms + flush_ms + pres_ms));
         std::fprintf(stderr,
             "soulcalibur2 speed: %.1f frames a second, longest frame %.1f ms, sound gaps %llu "
-            "(caps %s) | draw=%.2f upload=%.2f dec=%.2f flush=%.2f pres=%.2f wait=%.2f vblank=%.2f ms/f "
+            "(caps %s) | guest=%.2f prep=%.2f draw=%.2f upload=%.2f dec=%.2f flush=%.2f pres=%.2f wait=%.2f vblank=%.2f ms/f "
             "max(d=%.1f f=%.1f p=%.1f ms) (d=%u u=%u dec=%u f=%u)\n",
-            frames * 1e9 / double(now - window_start), longest / 1e6, gaps - gaps_before,
+            frames * 1000.0 / elapsed_ms, longest / 1e6, gaps - gaps_before,
             coreCaps().c_str(),
-            (perf.draw_ns / 1e6) / denom,
-            (perf.upload_ns / 1e6) / denom,
-            (perf.tex_decode_ns / 1e6) / denom,
-            (perf.flush_ns / 1e6) / denom,
-            (perf.present_total_ns / 1e6) / denom,
-            (perf.present_wait_ns / 1e6) / denom,
+            guest_ms, prep_ms, draw_ms, upload_ms, decode_ms, flush_ms, pres_ms, wait_ms,
             vblank_ms / denom,
             perf.max_frame_draw_ns / 1e6,
             perf.max_frame_flush_ns / 1e6,

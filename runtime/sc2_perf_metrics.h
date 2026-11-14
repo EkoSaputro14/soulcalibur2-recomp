@@ -25,6 +25,10 @@ typedef struct RecompD3dPresenterPerf {
 } RecompD3dPresenterPerf;
 
 void recomp_d3d_presenter_take_perf(RecompD3dPresenterPerf *out);
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+uint64_t sc2_d3d8_take_draw_prep_ns(void);
 
 #ifdef __cplusplus
 }

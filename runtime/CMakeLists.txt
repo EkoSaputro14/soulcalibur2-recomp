@@ -583,8 +583,9 @@ if(RECOMP_PROGRAM_DIR)
     if(ANDROID)
         target_link_libraries(recomp_program_runner PRIVATE log)
         target_link_options(recomp_program_runner PRIVATE -flto=thin -fuse-ld=lld -Wl,--thinlto-jobs=2 -Wl,--gc-sections)
-        set_property(SOURCE d3d_presenter_sdl_gpu.cpp d3d_light_model.c d3d_render_state_model.c
-            dsound_mix_model.c xbox_adpcm.c
+        set_property(SOURCE d3d_presenter_sdl_gpu.cpp d3d_draw_shader.cpp d3d_pixel_program.cpp
+            d3d8_draw_adapter.c d3d8_adapter.c d3d8_state_adapter.c d3d_light_model.c
+            d3d_render_state_model.c dsound_mix_model.c xbox_adpcm.c
             APPEND PROPERTY COMPILE_OPTIONS "-ffp-contract=fast" "-fno-math-errno")
     endif()
     recomp_use_sdl3(recomp_program_runner)

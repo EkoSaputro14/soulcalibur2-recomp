@@ -196,8 +196,8 @@ jobs:
         if: steps.apk.outputs.built == 'true' && (github.event_name == 'push' || inputs.publish_release != false)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}-android-perf3', '0.4.0-beta.1') }}
-          name: Soulcalibur II Recomp Android (Perf + Telemetry)
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}-android-perf6', '0.4.0-beta.1') }}
+          name: Soulcalibur II Recomp Android (Perf6 - Prime Core, O(1) Dispatch & Draw Opts)
           prerelease: true
           files: |
             build/Soulcalibur2Recomp-android.apk

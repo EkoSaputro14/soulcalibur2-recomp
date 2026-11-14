@@ -138,7 +138,25 @@ void testCpuAffinity()
     const auto c3b = sc2::SelectActiveCores(flagship_throttled);
     CHECK((c3b == std::vector<int>{4, 5, 6}));
 
-    // Case 4: Only 1 performance core online -> falls back to incluir LITTLE cores so >= 2 cores are available.
+    // Case 3c: Midrange 1+3+4 (4x 1.38 + 3x 1.40 + 1x 2.02 GHz) -> Prime leads Mid by +44% (>= 20%),
+    // so pins strictly to the 2.02 GHz Prime core ({7}) to prevent EAS from trapping the main loop at 1.40 GHz.
+    std::vector<sc2::CpuFreqInfo> mid_134 = {
+        {true, 1380000, 1380000}, {true, 1380000, 1380000},
+        {true, 1380000, 1380000}, {true, 1380000, 1380000},
+        {true, 1400000, 1400000}, {true, 1400000, 1400000},
+        {true, 1400000, 1400000}, {true, 2020000, 2020000},
+    };
+    const auto c3c = sc2::SelectActiveCores(mid_134);
+    CHECK((c3c == std::vector<int>{7}));
+
+    // Case 3d: Midrange 1+3+4 when Prime thermally drops to 1.60 GHz (< 120% of 1.40 GHz)
+    // -> expands back to {4, 5, 6, 7} so thermal load spreads cleanly across performance cores.
+    std::vector<sc2::CpuFreqInfo> mid_134_warm = mid_134;
+    mid_134_warm[7].scaling_max_khz = 1600000;
+    const auto c3d = sc2::SelectActiveCores(mid_134_warm);
+    CHECK((c3d == std::vector<int>{4, 5, 6, 7}));
+
+    // Case 4: Only 1 performance core online -> falls back to include LITTLE cores so >= 2 cores are available.
     std::vector<sc2::CpuFreqInfo> one_fast_only = {
         {true, 1400000, 1400000}, {true, 1400000, 1400000},
         {true, 1400000, 1400000}, {true, 1400000, 1400000},
