@@ -123,24 +123,31 @@ void testCpuAffinity()
     const auto c2 = sc2::SelectActiveCores(throttled);
     CHECK((c2 == std::vector<int>{4, 5, 6, 7}));
 
-    // Case 3: Flagship 1x 2.8 GHz + 3x 2.4 GHz + 4x 1.8 GHz -> picks 4 fast cores, skips slow 4x 1.8 GHz.
+    // Case 3: Flagship 1x 2.84 GHz + 3x 2.42 GHz + 4x 1.79 GHz -> pins Prime {7} when cool (+17% > +15%),
+    // and shifts to Mid performance cluster {4, 5, 6} when avoid_prime_thermal is active.
     std::vector<sc2::CpuFreqInfo> flagship = {
-        {true, 1800000, 1800000}, {true, 1800000, 1800000},
-        {true, 1800000, 1800000}, {true, 1800000, 1800000},
-        {true, 2400000, 2400000}, {true, 2400000, 2400000},
-        {true, 2400000, 2400000}, {true, 2800000, 2800000},
+        {true, 1790000, 1790000}, {true, 1790000, 1790000},
+        {true, 1790000, 1790000}, {true, 1790000, 1790000},
+        {true, 2420000, 2420000}, {true, 2420000, 2420000},
+        {true, 2420000, 2420000}, {true, 2840000, 2840000},
     };
-    const auto c3 = sc2::SelectActiveCores(flagship);
-    CHECK((c3 == std::vector<int>{4, 5, 6, 7}));
+    const auto c3 = sc2::SelectActiveCores(flagship, false);
+    CHECK((c3 == std::vector<int>{7}));
+    const auto c3_shield = sc2::SelectActiveCores(flagship, true);
+    CHECK((c3_shield == std::vector<int>{4, 5, 6}));
 
-    // Case 3b: Flagship 1+3+4 when single Prime core throttles to 1.4 GHz -> selects 3 unthrottled Mid performance cores.
+    // Case 3b: Flagship 1+3+4 when single Prime core throttles to 1.4 GHz or is isolated -> selects {4, 5, 6}.
     std::vector<sc2::CpuFreqInfo> flagship_throttled = flagship;
     flagship_throttled[7].scaling_max_khz = 1400000;
     const auto c3b = sc2::SelectActiveCores(flagship_throttled);
     CHECK((c3b == std::vector<int>{4, 5, 6}));
+    std::vector<sc2::CpuFreqInfo> flagship_isolated = flagship;
+    flagship_isolated[7].isolated = true;
+    const auto c3_iso = sc2::SelectActiveCores(flagship_isolated);
+    CHECK((c3_iso == std::vector<int>{4, 5, 6}));
 
-    // Case 3c: Midrange 1+3+4 (4x 1.38 + 3x 1.40 + 1x 2.02 GHz) -> Prime leads Mid by +44% (>= 20%),
-    // so pins strictly to the 2.02 GHz Prime core ({7}) to prevent EAS from trapping the main loop at 1.40 GHz.
+    // Case 3c: Midrange 1+3+4 (4x 1.38 + 3x 1.40 + 1x 2.02 GHz) -> Prime leads Mid by +44% (>= 15%),
+    // so pins strictly to the 2.02 GHz Prime core ({7}), and avoids it when isolated or thermally shielded.
     std::vector<sc2::CpuFreqInfo> mid_134 = {
         {true, 1380000, 1380000}, {true, 1380000, 1380000},
         {true, 1380000, 1380000}, {true, 1380000, 1380000},
@@ -149,8 +156,10 @@ void testCpuAffinity()
     };
     const auto c3c = sc2::SelectActiveCores(mid_134);
     CHECK((c3c == std::vector<int>{7}));
+    const auto c3c_shield = sc2::SelectActiveCores(mid_134, true);
+    CHECK((c3c_shield == std::vector<int>{4, 5, 6}));
 
-    // Case 3d: Midrange 1+3+4 when Prime thermally drops to 1.60 GHz (< 120% of 1.40 GHz)
+    // Case 3d: Midrange 1+3+4 when Prime thermally drops to 1.60 GHz (< 115% of 1.40 GHz)
     // -> expands back to {4, 5, 6, 7} so thermal load spreads cleanly across performance cores.
     std::vector<sc2::CpuFreqInfo> mid_134_warm = mid_134;
     mid_134_warm[7].scaling_max_khz = 1600000;

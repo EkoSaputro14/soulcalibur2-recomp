@@ -40,9 +40,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -292,6 +294,8 @@ struct QueuedDraw {
     SDL_GPUSampler *samplers[4]{};
     uint32_t uniform_offset = 0u;
     uint32_t program_offset = UINT32_MAX;
+    uint64_t uniform_hash = 0u;
+    uint64_t program_hash = 0u;
     SDL_FColor blend_constants{};
     float sampler_bias[4]{};  // Metal applies sampler LOD bias in the shader
     uint8_t stencil_ref = 0u;
@@ -406,9 +410,17 @@ struct RecompD3dPresenter {
         PipelineKey key{};
         SDL_GPUGraphicsPipeline *pipeline = nullptr;
     };
+    struct WarmFamilyTask {
+        PipelineKey base{};
+        RecompD3dVertexLayout layout{};
+    };
     ShaderInlineEntry shader_inline_cache[kShaderInlineSlots]{};
     PipelineInlineEntry pipeline_inline_cache[kPipelineInlineSlots]{};
     std::unordered_set<uint64_t> saved_pipeline_hashes;
+    std::unordered_set<uint64_t> warmed_families;
+    std::mutex warm_lock;
+    std::condition_variable warm_cv;
+    std::deque<WarmFamilyTask> warm_queue;
     std::thread precompile;
     std::atomic<bool> precompile_stop{false};
     std::atomic<int> foreground_shader_compiles{0};
@@ -1504,6 +1516,9 @@ ShaderPair lookupShaders(RecompD3dPresenter *presenter, const RecompD3dDrawShade
 // ponytail: fixed list; vertex-program shaders and unlisted FVFs still compile on first use.
 void precompileSavedPipelines(RecompD3dPresenter *presenter);
 
+// Background pipeline variant warmer declaration; defined after buildGraphicsPipeline.
+void warmPendingPipelineVariants(RecompD3dPresenter *presenter);
+
 void precompileDrawShaders(RecompD3dPresenter *presenter)
 {
 #ifdef __ANDROID__
@@ -1584,6 +1599,10 @@ void precompileDrawShaders(RecompD3dPresenter *presenter)
     std::fprintf(stderr, "recomp d3d presenter: precompiled %u draw shaders in %lld ms\n", compiled,
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count()));
+
+    // Stay ready to pre-build common blend/cull/depth-write pipeline variants on an idle core
+    // as new character/effect shaders are first seen, preventing mid-fight PSO stalls.
+    warmPendingPipelineVariants(presenter);
 }
 
 SDL_GPUBlendFactor hostBlendFactor(RecompD3dBlendFactor factor, bool alpha_channel)
@@ -1694,6 +1713,7 @@ struct PipelineState {
     SDL_GPUTextureFormat depth_format;  // INVALID without depth
     SDL_GPUSampleCount samples;
     float slope_bias;
+    bool scaled_bias;
     bool coverage_only;
     bool count_pass;
 };
@@ -1989,6 +2009,104 @@ void precompileSavedPipelines(RecompD3dPresenter *presenter)
     }
 }
 
+uint64_t pipelineFamilyHash(const PipelineKey &key)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    const auto mix = [&](uint64_t v) {
+        h = (h ^ v) * 0x100000001b3ull;
+    };
+    mix(reinterpret_cast<uintptr_t>(key.vertex));
+    mix(reinterpret_cast<uintptr_t>(key.fragment));
+    mix(key.fvf);
+    mix(key.stride);
+    mix(key.primitive);
+    mix(key.color_format);
+    mix(key.depth_format);
+    mix(key.samples);
+    return h;
+}
+
+void enqueuePipelineFamilyWarmup(RecompD3dPresenter *presenter, const PipelineKey &key,
+    const RecompD3dVertexLayout &layout)
+{
+    if (key.coverage_only || key.count_pass || key.stencil_enable ||
+        key.primitive == static_cast<uint32_t>(SDL_GPU_PRIMITIVETYPE_LINELIST) ||
+        (key.fvf & 0x0eu) == 0x04u ||
+        key.depth_format == static_cast<uint32_t>(SDL_GPU_TEXTUREFORMAT_INVALID)) {
+        return;
+    }
+    const uint64_t fh = pipelineFamilyHash(key);
+    {
+        std::lock_guard<std::mutex> lock(presenter->warm_lock);
+        if (!presenter->warmed_families.insert(fh).second) return;
+        if (presenter->warm_queue.size() >= 64u) return;
+        presenter->warm_queue.push_back({key, layout});
+    }
+    presenter->warm_cv.notify_one();
+}
+
+void warmPendingPipelineVariants(RecompD3dPresenter *presenter)
+{
+    for (;;) {
+        RecompD3dPresenter::WarmFamilyTask task{};
+        {
+            std::unique_lock<std::mutex> lock(presenter->warm_lock);
+            presenter->warm_cv.wait(lock, [&] {
+                return presenter->precompile_stop.load(std::memory_order_relaxed) ||
+                       !presenter->warm_queue.empty();
+            });
+            if (presenter->precompile_stop.load(std::memory_order_relaxed)) break;
+            task = presenter->warm_queue.front();
+            presenter->warm_queue.pop_front();
+        }
+        // Build the most common SC2 render-state permutations for this newly encountered shader family:
+        // opaque, standard alpha blend (depth write off), additive blend (depth write off), and two-sided.
+        struct VariantSpec {
+            uint32_t cull;
+            uint8_t depth_write;
+            uint8_t blend_enable;
+            uint8_t src_factor;
+            uint8_t dst_factor;
+        };
+        const VariantSpec variants[] = {
+            {task.base.cull, 1u, 0u, 0u, 0u},
+            {task.base.cull, 0u, 1u, static_cast<uint8_t>(RECOMP_D3D_BLEND_SRC_ALPHA),
+                static_cast<uint8_t>(RECOMP_D3D_BLEND_INV_SRC_ALPHA)},
+            {static_cast<uint32_t>(RECOMP_D3D_CULL_NONE), 0u, 1u,
+                static_cast<uint8_t>(RECOMP_D3D_BLEND_SRC_ALPHA),
+                static_cast<uint8_t>(RECOMP_D3D_BLEND_INV_SRC_ALPHA)},
+            {static_cast<uint32_t>(RECOMP_D3D_CULL_NONE), 0u, 1u,
+                static_cast<uint8_t>(RECOMP_D3D_BLEND_SRC_ALPHA),
+                static_cast<uint8_t>(RECOMP_D3D_BLEND_ONE)},
+        };
+        for (const VariantSpec &v : variants) {
+            pauseForForegroundCompile(presenter);
+            if (presenter->precompile_stop.load(std::memory_order_relaxed)) return;
+            PipelineKey pkey = task.base;
+            pkey.cull = v.cull;
+            pkey.depth_test = 1u;
+            pkey.depth_write = v.depth_write;
+            pkey.depth_func = static_cast<uint8_t>(RECOMP_D3D_COMPARE_LESS_EQUAL);
+            pkey.blend_enable = v.blend_enable;
+            pkey.write_mask = 0xfu;
+            pkey.src_factor = v.src_factor;
+            pkey.dst_factor = v.dst_factor;
+            pkey.blend_op = static_cast<uint8_t>(RECOMP_D3D_BLEND_OP_ADD);
+            {
+                std::lock_guard<std::mutex> lock(presenter->pipeline_lock);
+                if (presenter->pipelines.find(pkey) != presenter->pipelines.end()) continue;
+            }
+            SDL_GPUGraphicsPipeline *pipeline = buildGraphicsPipeline(presenter, pkey, task.layout);
+            if (pipeline == nullptr) continue;
+            std::lock_guard<std::mutex> lock(presenter->pipeline_lock);
+            const auto inserted = presenter->pipelines.emplace(pkey, pipeline);
+            if (!inserted.second) {
+                SDL_ReleaseGPUGraphicsPipeline(presenter->device, pipeline);
+            }
+        }
+    }
+}
+
 SDL_GPUGraphicsPipeline *lookupPipeline(RecompD3dPresenter *presenter, const PipelineState &state)
 {
     const RecompD3dPresenterDrawCommand &draw = *state.draw;
@@ -2091,10 +2209,10 @@ SDL_GPUGraphicsPipeline *lookupPipeline(RecompD3dPresenter *presenter, const Pip
             inline_slot->key = key;
             inline_slot->pipeline = pipeline;
         }
-        const bool scaled_bias = state.samples > SDL_GPU_SAMPLECOUNT_1 && state.slope_bias == 0.0f &&
-            draw.slope_scaled_depth_bias != 0.0f;
+        const bool scaled_bias = state.scaled_bias;
         const bool sample_bias = scaled_bias && state.samples > SDL_GPU_SAMPLECOUNT_1;
         savePipelineRecord(presenter, key, draw, scaled_bias, sample_bias);
+        if (on_owner) enqueuePipelineFamilyWarmup(presenter, key, state.shaders.layout);
     }
     return pipeline;
 }
@@ -2421,18 +2539,15 @@ void queueDraw(RecompD3dPresenter *presenter, SDL_GPUGraphicsPipeline *pipeline,
     const size_t head_bytes = 140u * sizeof(float);
     const size_t tail_floats = kTransformFloats - 140u;
     const size_t tail_bytes = tail_floats * sizeof(float);
+    const uint64_t uniform_hash = hashBytes(tail_src, tail_bytes, hashBytes(constants, head_bytes));
+    queued.uniform_hash = uniform_hash;
     queued.uniform_offset = UINT32_MAX;
     const size_t check_count = std::min<size_t>(segment.draws.size(), 4u);
     for (size_t back_idx = 0u; back_idx < check_count; ++back_idx) {
-        const uint32_t candidate_offset = segment.draws[segment.draws.size() - 1u - back_idx].uniform_offset;
-        bool already_checked = false;
-        for (size_t prev = 0u; prev < back_idx; ++prev) {
-            if (segment.draws[segment.draws.size() - 1u - prev].uniform_offset == candidate_offset) {
-                already_checked = true;
-                break;
-            }
-        }
-        if (already_checked || candidate_offset + kTransformFloats > uniforms.size()) continue;
+        const QueuedDraw &prev_draw = segment.draws[segment.draws.size() - 1u - back_idx];
+        if (prev_draw.uniform_hash != uniform_hash) continue;
+        const uint32_t candidate_offset = prev_draw.uniform_offset;
+        if (candidate_offset + kTransformFloats > uniforms.size()) continue;
         if (std::memcmp(uniforms.data() + candidate_offset, constants, head_bytes) == 0 &&
             std::memcmp(uniforms.data() + candidate_offset + 140u, tail_src, tail_bytes) == 0) {
             queued.uniform_offset = candidate_offset;
@@ -2447,17 +2562,13 @@ void queueDraw(RecompD3dPresenter *presenter, SDL_GPUGraphicsPipeline *pipeline,
     }
     if (program) {
         const float *vc = constants + 140u;
+        const uint64_t program_hash = hashBytes(vc, kProgramFloats * sizeof(float));
+        queued.program_hash = program_hash;
         for (size_t back_idx = 0u; back_idx < check_count; ++back_idx) {
-            const uint32_t candidate_offset = segment.draws[segment.draws.size() - 1u - back_idx].program_offset;
-            if (candidate_offset == UINT32_MAX || candidate_offset + kProgramFloats > uniforms.size()) continue;
-            bool already_checked = false;
-            for (size_t prev = 0u; prev < back_idx; ++prev) {
-                if (segment.draws[segment.draws.size() - 1u - prev].program_offset == candidate_offset) {
-                    already_checked = true;
-                    break;
-                }
-            }
-            if (already_checked) continue;
+            const QueuedDraw &prev_draw = segment.draws[segment.draws.size() - 1u - back_idx];
+            if (prev_draw.program_offset == UINT32_MAX || prev_draw.program_hash != program_hash) continue;
+            const uint32_t candidate_offset = prev_draw.program_offset;
+            if (candidate_offset + kProgramFloats > uniforms.size()) continue;
             if (std::memcmp(uniforms.data() + candidate_offset, vc, kProgramFloats * sizeof(float)) == 0) {
                 queued.program_offset = candidate_offset;
                 break;
@@ -2838,6 +2949,7 @@ RecompD3dPresenterError submitDraw(RecompD3dPresenter *presenter, const RecompD3
     state.depth_format = bound.depth != nullptr ? presenter->depth_format : SDL_GPU_TEXTUREFORMAT_INVALID;
     state.samples = bound.samples;
     state.slope_bias = scaled_bias ? 0.0f : draw.slope_scaled_depth_bias;
+    state.scaled_bias = scaled_bias;
     SDL_GPUGraphicsPipeline *pipeline = lookupPipeline(presenter, state);
     if (pipeline == nullptr) return unsupportedDraw(__LINE__);
 
@@ -4038,15 +4150,20 @@ RecompD3dPresenterError d3d_backend_submit(RecompD3dPresenter *presenter, const 
     case RECOMP_D3D_PRESENTER_COMMAND_PRESENT:
         return submitPresent(presenter, command->data.present);
     case RECOMP_D3D_PRESENTER_COMMAND_DRAW: {
-        const uint64_t t0 = steadyNowNs();
+        static uint32_t perf_draw_sample = 0u;
+        const bool sample_clock = presenter->draw_log_active || ((perf_draw_sample++ & 7u) == 0u);
+        const uint64_t t0 = sample_clock ? steadyNowNs() : 0u;
         const auto error = submitDraw(presenter, command->data.draw);
-        const uint64_t elapsed_ns = steadyNowNs() - t0;
-        g_perf_draw_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
-        g_frame_draw_ns += elapsed_ns;
-        g_perf_draws.fetch_add(1u, std::memory_order_relaxed);
-        if (presenter->draw_log_active) {
-            logDraw(presenter, command->data.draw, error, static_cast<double>(elapsed_ns) / 1000.0);
+        if (sample_clock) {
+            const uint64_t raw_ns = steadyNowNs() - t0;
+            const uint64_t weighted_ns = presenter->draw_log_active ? raw_ns : (raw_ns * 8u);
+            g_perf_draw_ns.fetch_add(weighted_ns, std::memory_order_relaxed);
+            g_frame_draw_ns += weighted_ns;
+            if (presenter->draw_log_active) {
+                logDraw(presenter, command->data.draw, error, static_cast<double>(raw_ns) / 1000.0);
+            }
         }
+        g_perf_draws.fetch_add(1u, std::memory_order_relaxed);
         return error;
     }
     case RECOMP_D3D_PRESENTER_COMMAND_VISIBILITY_BEGIN:
@@ -4274,7 +4391,11 @@ RecompD3dPresenterError d3d_backend_destroy(RecompD3dPresenter **presenter)
     RecompD3dPresenter *destroyed = *presenter;
     active_presenter = nullptr;
     *presenter = nullptr;
-    destroyed->precompile_stop = true;
+    {
+        std::lock_guard<std::mutex> lock(destroyed->warm_lock);
+        destroyed->precompile_stop = true;
+    }
+    destroyed->warm_cv.notify_all();
     if (destroyed->precompile.joinable()) destroyed->precompile.join();
     releasePresenter(destroyed);
     delete destroyed;

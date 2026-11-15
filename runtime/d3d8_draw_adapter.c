@@ -1252,22 +1252,27 @@ static void attach_program(uint32_t device, RecompD3dPresenterDrawCommand *draw)
     const uint32_t *bytecode =
         (const uint32_t *)(const void *)recomp_memory(handle - 1u + 0x114u, words[3] * 4u);
 
-    static uint32_t cached_handle;
-    static uint32_t cached_words[0x114u / 4u];
-    static uint32_t cached_bytecode[680u];
-    static uint32_t cached_fvf;
-    static GatherPlan cached_gather;
-    static uint32_t cached_program_count;
-    static uint32_t cached_program[136u][4u];
+    typedef struct {
+        uint32_t handle;
+        uint32_t words[0x114u / 4u];
+        uint32_t bytecode[680u];
+        uint32_t fvf;
+        GatherPlan gather;
+        uint32_t program_count;
+        uint32_t program[136u][4u];
+    } AttachProgramCacheEntry;
+    enum { ATTACH_CACHE_SLOTS = 16u };
+    static AttachProgramCacheEntry attach_cache[ATTACH_CACHE_SLOTS];
+    AttachProgramCacheEntry *entry = &attach_cache[(handle ^ (handle >> 6u)) & (ATTACH_CACHE_SLOTS - 1u)];
 
     uint32_t fvf;
-    if (cached_handle == handle &&
-        memcmp(words, cached_words, sizeof words) == 0 &&
-        memcmp(bytecode, cached_bytecode, (size_t)words[3] * 4u) == 0) {
-        fvf = cached_fvf;
-        gather = cached_gather;
-        draw->program_count = cached_program_count;
-        memcpy(draw->program, cached_program, (size_t)cached_program_count * sizeof draw->program[0]);
+    if (entry->handle == handle &&
+        memcmp(words, entry->words, sizeof words) == 0 &&
+        memcmp(bytecode, entry->bytecode, (size_t)words[3] * 4u) == 0) {
+        fvf = entry->fvf;
+        gather = entry->gather;
+        draw->program_count = entry->program_count;
+        memcpy(draw->program, entry->program, (size_t)entry->program_count * sizeof draw->program[0]);
     } else {
         /* The declaration's registers in FVF order, gathered from its streams
            when needed (declaration_fvf); the program reads v0, v2, v3, v9-v12. */
@@ -1281,13 +1286,13 @@ static void attach_program(uint32_t device, RecompD3dPresenterDrawCommand *draw)
         }
         draw->program_count = words[2];
 
-        cached_handle = handle;
-        memcpy(cached_words, words, sizeof words);
-        memcpy(cached_bytecode, bytecode, (size_t)words[3] * 4u);
-        cached_fvf = fvf;
-        cached_gather = gather;
-        cached_program_count = words[2];
-        memcpy(cached_program, draw->program, (size_t)words[2] * sizeof draw->program[0]);
+        entry->handle = handle;
+        memcpy(entry->words, words, sizeof words);
+        memcpy(entry->bytecode, bytecode, (size_t)words[3] * 4u);
+        entry->fvf = fvf;
+        entry->gather = gather;
+        entry->program_count = words[2];
+        memcpy(entry->program, draw->program, (size_t)words[2] * sizeof draw->program[0]);
     }
     recomp_guest_load(draw->program_constants, 0x0015d570u, sizeof draw->program_constants);
     RecompD3dViewport viewport;
@@ -2089,7 +2094,8 @@ static const uint16_t *sequential_index_table(void)
 static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
     uint32_t stride, uint32_t index_address)
 {
-    const uint64_t prep_t0 = draw_prep_now_ns();
+    const bool sample_prep_clock = (draw_submitted & 7u) == 0u;
+    const uint64_t prep_t0 = sample_prep_clock ? draw_prep_now_ns() : 0ull;
     const uint32_t device = recomp_d3d8_require_device();
     const bool quads = primitive == 8u;
     if (quads) count &= ~3u;
@@ -2112,9 +2118,15 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
     const size_t mask_start = offsetof(RecompD3dPresenterCommand, data.draw.program_alpha_mask);
     const size_t dir_start = offsetof(RecompD3dPresenterCommand, data.draw.directional);
     const size_t after_dir = offsetof(RecompD3dPresenterCommand, data.draw.vertex_bytes);
+    const size_t refl_mats_start = offsetof(RecompD3dPresenterCommand, data.draw.reflection_world_view);
+    const size_t refl_stage2_start = offsetof(RecompD3dPresenterCommand, data.draw.reflection_stage2);
+    const size_t refl_stage2_tf_start = offsetof(RecompD3dPresenterCommand, data.draw.reflection_stage2_transform);
+    const size_t pixel_prog_start = offsetof(RecompD3dPresenterCommand, data.draw.pixel_program);
     memset(&command, 0, zero_head);
     memset((uint8_t *)&command + mask_start, 0, dir_start - mask_start);
-    memset((uint8_t *)&command + after_dir, 0, sizeof command - after_dir);
+    memset((uint8_t *)&command + after_dir, 0, refl_mats_start - after_dir);
+    memset((uint8_t *)&command + refl_stage2_start, 0, refl_stage2_tf_start - refl_stage2_start);
+    memset((uint8_t *)&command + pixel_prog_start, 0, sizeof command - pixel_prog_start);
     RecompD3dPresenterDrawCommand *draw = &command.data.draw;
     draw->directional.enabled = false;
     draw->directional.normalize = false;
@@ -2386,14 +2398,16 @@ static void submit_draw(uint32_t primitive, uint32_t count, uint32_t vertices,
     } else if (primitive == 2u) {
         (void)widen_lines(program || !layout.pretransformed, draw);
     }
-    const uint64_t prep_t1 = draw_prep_now_ns();
-    if (prep_t0 != 0ull && prep_t1 >= prep_t0) {
-        const uint64_t delta = prep_t1 - prep_t0;
+    if (prep_t0 != 0ull) {
+        const uint64_t prep_t1 = draw_prep_now_ns();
+        if (prep_t1 >= prep_t0) {
+            const uint64_t delta = (prep_t1 - prep_t0) * 8ull;
 #if defined(__GNUC__) || defined(__clang__)
-        __atomic_fetch_add(&draw_prep_accum_ns, delta, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&draw_prep_accum_ns, delta, __ATOMIC_RELAXED);
 #else
-        draw_prep_accum_ns += delta;
+            draw_prep_accum_ns += delta;
 #endif
+        }
     }
     /* The free camera's clean view leaves out the game's 2D overlay (life
        bars, timer, names, menus): fixed-function draws already in screen

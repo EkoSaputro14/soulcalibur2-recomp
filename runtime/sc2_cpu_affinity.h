@@ -11,11 +11,12 @@ struct CpuFreqInfo {
     bool online = true;
     long info_max_khz = 0;
     long scaling_max_khz = 0;
+    bool isolated = false;
 };
 
 inline long effectiveCoreFreqKhz(const CpuFreqInfo &core)
 {
-    if (!core.online) return 0;
+    if (!core.online || core.isolated) return 0;
     if (core.info_max_khz > 0 && core.scaling_max_khz > 0) {
         return std::min(core.info_max_khz, core.scaling_max_khz);
     }
@@ -23,19 +24,23 @@ inline long effectiveCoreFreqKhz(const CpuFreqInfo &core)
 }
 
 // Selects active CPU cores for the main game + inline presenter thread:
-// 1) On heterogeneous big.LITTLE / DynamIQ SoCs (max_info_max > min_info_max), cores with
+// 1) Excludes offline and thermally isolated cores (effectiveCoreFreqKhz == 0).
+// 2) On heterogeneous big.LITTLE / DynamIQ SoCs (max_info_max > min_info_max), cores with
 //    info_max_khz > min_info_max are out-of-order performance cores (Big / Mid / Prime), while
 //    cores at min_info_max are in-order LITTLE efficiency cores (e.g. Cortex-A53/A55).
-// 2) Whenever >= 2 performance cores are online, restricts selection strictly to performance
+// 3) Whenever >= 2 performance cores are online, restricts selection strictly to performance
 //    cores so Android EAS never migrates the single-threaded main loop onto slow LITTLE cores,
 //    and never evicts 2-big-core clusters (2+6 SoCs) into LITTLE-only masks when scaling_max_freq
-//    thermally throttles (eliminating 2-second 6/8 <-> 8/8 affinity oscillation).
-// 3) On asymmetric 3-tier SoCs (e.g. 1 Prime 2.02 GHz + 3 Mid 1.40 GHz + 4 LITTLE 1.38 GHz),
-//    when the Prime cluster leads the Mid performance tier by >= 20% (and thus fails the 70%
-//    threshold), keep ONLY the Prime core(s) rather than expanding with Mid cores, preventing Android
-//    EAS from trapping or bouncing the single-threaded main loop on slow 1.40 GHz Mid cores.
-//    If the Prime core thermally throttles below 120% of Mid, expansion recovers cleanly.
-inline std::vector<int> SelectActiveCores(const std::vector<CpuFreqInfo> &cores)
+//    thermally throttles.
+// 4) On 3-tier SoCs (e.g. 1x Prime + 3x Mid + 4x LITTLE):
+//    - When avoid_prime_thermal is false and Prime leads Mid by >= 15% (e.g. 2.84 vs 2.42 GHz,
+//      or 2.02 vs 1.40 GHz), pins the Prime core(s) so EAS doesn't drop the main thread onto a
+//      slower Mid core while cool.
+//    - When avoid_prime_thermal is true (hot Prime die sensor) and >= 2 non-Prime performance
+//      cores remain online, shifts the main loop onto the Mid performance cluster so the Prime core
+//      can cool down before firmware thermal daemons isolate it and clamp the Mid cluster.
+inline std::vector<int> SelectActiveCores(const std::vector<CpuFreqInfo> &cores,
+    bool avoid_prime_thermal = false)
 {
     const size_t n = cores.size();
     std::vector<long> effective(n, 0);
@@ -61,6 +66,7 @@ inline std::vector<int> SelectActiveCores(const std::vector<CpuFreqInfo> &cores)
     if (best_all <= 0 || available == 0) return selected;
 
     int perf_online = 0;
+    int non_prime_perf_online = 0;
     long best_perf = 0;
     long best_little = 0;
     if (max_info_max > min_info_max) {
@@ -69,12 +75,34 @@ inline std::vector<int> SelectActiveCores(const std::vector<CpuFreqInfo> &cores)
             if (effective[i] > 0) {
                 if (hw_max > min_info_max) {
                     ++perf_online;
+                    if (hw_max < max_info_max) ++non_prime_perf_online;
                     if (effective[i] > best_perf) best_perf = effective[i];
                 } else {
                     if (effective[i] > best_little) best_little = effective[i];
                 }
             }
         }
+    }
+
+    const bool exclude_prime = avoid_prime_thermal && (non_prime_perf_online >= 2);
+    if (exclude_prime) {
+        perf_online = 0;
+        best_perf = 0;
+        best_all = 0;
+        available = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const long hw_max = cores[i].info_max_khz > 0 ? cores[i].info_max_khz : effective[i];
+            if (hw_max >= max_info_max) effective[i] = 0;
+            if (effective[i] > 0) {
+                ++available;
+                if (effective[i] > best_all) best_all = effective[i];
+                if (hw_max > min_info_max) {
+                    ++perf_online;
+                    if (effective[i] > best_perf) best_perf = effective[i];
+                }
+            }
+        }
+        if (best_all <= 0 || available == 0) return selected;
     }
 
     const bool use_perf_only = (perf_online >= 2 && best_perf > 0);
@@ -90,6 +118,9 @@ inline std::vector<int> SelectActiveCores(const std::vector<CpuFreqInfo> &cores)
         }
     }
 
+    const bool pin_prime_only = (!exclude_prime && use_perf_only && second_tier_perf > 0 &&
+        best_perf * 100 >= second_tier_perf * 115);
+
     auto isCandidate = [&](size_t i) -> bool {
         if (effective[i] <= 0) return false;
         if (!use_perf_only) return true;
@@ -99,15 +130,22 @@ inline std::vector<int> SelectActiveCores(const std::vector<CpuFreqInfo> &cores)
 
     std::vector<bool> picked(n, false);
     int picked_count = 0;
-    for (size_t i = 0; i < n; ++i) {
-        if (isCandidate(i) && effective[i] * 100 >= reference_best * 70) {
-            picked[i] = true;
-            ++picked_count;
+    if (pin_prime_only) {
+        for (size_t i = 0; i < n; ++i) {
+            if (isCandidate(i) && effective[i] * 100 >= best_perf * 98) {
+                picked[i] = true;
+                ++picked_count;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) {
+            if (isCandidate(i) && effective[i] * 100 >= reference_best * 70) {
+                picked[i] = true;
+                ++picked_count;
+            }
         }
     }
 
-    const bool pin_prime_only = (use_perf_only && picked_count == 1 && second_tier_perf > 0 &&
-        best_perf * 100 >= second_tier_perf * 120);
     const int min_cores = use_perf_only ? std::min(2, perf_online) : std::min(4, available);
     while (!pin_prime_only && picked_count < min_cores) {
         long next_best = 0;

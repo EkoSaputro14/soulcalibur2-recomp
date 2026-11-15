@@ -196,8 +196,8 @@ jobs:
         if: steps.apk.outputs.built == 'true' && (github.event_name == 'push' || inputs.publish_release != false)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}-android-perf7', '0.4.0-beta.1') }}
-          name: Soulcalibur II Recomp Android (Perf7 - Inline Memory/Reg Fast Paths, 2-Way Dispatch & Shader Opts)
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}-android-perf8', '0.4.0-beta.1') }}
+          name: Soulcalibur II Recomp Android (Perf8 - Thermal Shield, Async Pipeline Warmer & Draw/Prep Opts)
           prerelease: true
           files: |
             build/Soulcalibur2Recomp-android.apk

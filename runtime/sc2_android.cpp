@@ -142,8 +142,9 @@ static std::string coreCaps()
     return sc2::FormatClusterCaps(readClusterFreqs());
 }
 
-static std::string readThermalStatus()
+static std::string readThermalStatus(double *out_temp_c = nullptr)
 {
+    if (out_temp_c != nullptr) *out_temp_c = 0.0;
     std::vector<sc2::ThermalZoneSample> zones;
     for (int i = 0; i < 64; ++i) {
         char temp_path[96];
@@ -180,6 +181,7 @@ static std::string readThermalStatus()
     }
     sc2::ThermalZoneSample best;
     if (!sc2::SelectBestThermalZone(zones, best)) return "n/a";
+    if (out_temp_c != nullptr) *out_temp_c = best.temp_c;
     char out[96];
     if (best.type.empty()) {
         std::snprintf(out, sizeof out, "%.1fC", best.temp_c);
@@ -189,9 +191,8 @@ static std::string readThermalStatus()
     return out;
 }
 
-// Select active CPU cores dynamically using effective speeds (min(cpuinfo_max_freq, scaling_max_freq)).
-// Keeps >= min(4, available) fastest online cores so fibers, audio, video decode, and Vulkan do not
-// starve on 2 prime cores or stay trapped when prime cores throttle below the mid cluster.
+// Select active CPU cores dynamically using effective speeds (min(cpuinfo_max_freq, scaling_max_freq)),
+// core online/isolate state, and thermal hysteresis (>= 72.0 C shields Prime core onto Mid cluster).
 // SC2_FAST_CORES=1 restores the legacy static top > slowest 2-core filter for A/B checks.
 static void applyCoreAffinity(bool log_unchanged)
 {
@@ -201,9 +202,14 @@ static void applyCoreAffinity(bool log_unchanged)
     cpu_set_t desired;
     CPU_ZERO(&desired);
     int chosen_count = 0;
+    std::vector<sc2::CpuFreqInfo> cores;
+    std::vector<int> selected;
+    static bool avoid_prime_thermal = false;
+    bool using_legacy = false;
 
     const char *legacy = std::getenv("SC2_FAST_CORES");
     if (legacy != nullptr && *legacy == '1') {
+        using_legacy = true;
         std::vector<long> top(static_cast<size_t>(count), 0);
         long slowest = 0;
         for (int cpu = 0; cpu < count; ++cpu) {
@@ -225,7 +231,12 @@ static void applyCoreAffinity(bool log_unchanged)
         }
         if (chosen_count == 0) return;
     } else {
-        std::vector<sc2::CpuFreqInfo> cores(static_cast<size_t>(count));
+        double temp_c = 0.0;
+        readThermalStatus(&temp_c);
+        if (temp_c >= 72.0) avoid_prime_thermal = true;
+        else if (temp_c > 0.0 && temp_c <= 64.0) avoid_prime_thermal = false;
+
+        cores.resize(static_cast<size_t>(count));
         for (int cpu = 0; cpu < count; ++cpu) {
             char path[96];
             std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/online", cpu);
@@ -233,6 +244,13 @@ static void applyCoreAffinity(bool log_unchanged)
                 int online = 1;
                 if (std::fscanf(file, "%d", &online) == 1)
                     cores[static_cast<size_t>(cpu)].online = (online != 0);
+                std::fclose(file);
+            }
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/isolate", cpu);
+            if (std::FILE *file = std::fopen(path, "r")) {
+                int isolated = 0;
+                if (std::fscanf(file, "%d", &isolated) == 1)
+                    cores[static_cast<size_t>(cpu)].isolated = (isolated != 0);
                 std::fclose(file);
             }
             std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
@@ -248,7 +266,7 @@ static void applyCoreAffinity(bool log_unchanged)
                 std::fclose(file);
             }
         }
-        const std::vector<int> selected = sc2::SelectActiveCores(cores);
+        selected = sc2::SelectActiveCores(cores, avoid_prime_thermal);
         if (selected.empty()) return;
         for (int cpu : selected) CPU_SET(cpu, &desired);
         chosen_count = static_cast<int>(selected.size());
@@ -266,8 +284,29 @@ static void applyCoreAffinity(bool log_unchanged)
     if (sched_setaffinity(0, sizeof desired, &desired) == 0) {
         current_mask = desired;
         has_mask = true;
-        std::fprintf(stderr, "soulcalibur2: active cores = %d/%d (caps %s)\n",
-            chosen_count, count, coreCaps().c_str());
+        std::fprintf(stderr, "soulcalibur2: active cores = %d/%d%s (caps %s)\n",
+            chosen_count, count, avoid_prime_thermal ? " [thermal-shield]" : "", coreCaps().c_str());
+    } else if (!using_legacy && !selected.empty()) {
+        // Kernel cpuset/core_ctl may isolate a core without exposing sysfs .../isolate: mark
+        // the rejected mask's core(s) isolated and immediately fall back to the next tier.
+        for (int cpu : selected) {
+            if (cpu >= 0 && static_cast<size_t>(cpu) < cores.size()) {
+                cores[static_cast<size_t>(cpu)].isolated = true;
+            }
+        }
+        const std::vector<int> fallback = sc2::SelectActiveCores(cores, true);
+        if (!fallback.empty()) {
+            CPU_ZERO(&desired);
+            for (int cpu : fallback) CPU_SET(cpu, &desired);
+            chosen_count = static_cast<int>(fallback.size());
+            if ((!has_mask || !CPU_EQUAL(&desired, &current_mask)) &&
+                sched_setaffinity(0, sizeof desired, &desired) == 0) {
+                current_mask = desired;
+                has_mask = true;
+                std::fprintf(stderr, "soulcalibur2: active cores = %d/%d [isolated-fallback] (caps %s)\n",
+                    chosen_count, count, coreCaps().c_str());
+            }
+        }
     }
 }
 
