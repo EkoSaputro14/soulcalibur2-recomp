@@ -268,6 +268,8 @@ static inline void recomp_guest_store_inline(uint32_t destination, const void *s
 
 uint32_t *recomp_ebp_register(void);
 uint32_t *recomp_esp_register(void);
+static inline uint32_t *recomp_ebp_register_inline(void) { return &recomp_runtime.registers.ebp; }
+static inline uint32_t *recomp_esp_register_inline(void) { return &recomp_runtime.registers.esp; }
 bool recomp_dispatch(uint32_t guest_address);
 void recomp_dispatch_indirect(uint32_t guest_address, uint32_t saved_esp);
 void recomp_dispatch_indirect_site(
@@ -314,9 +316,9 @@ void recomp_read_watch_arm(uint32_t start, uint32_t end);
 #define edi recomp_runtime.registers.edi
 /* ponytail: global EBP preserves register state across split generated blocks. */
 #define ebp recomp_runtime.registers.ebp
-#define g_esp recomp_runtime.registers.esp
+#define g_esp (*recomp_esp_register_inline())
 #define esp recomp_runtime.registers.esp
-#define g_seh_ebp recomp_runtime.registers.ebp
+#define g_seh_ebp (*recomp_ebp_register_inline())
 #define MEM32(address) (*recomp_memory_u32((uint32_t)(address)))
 #define MEM16(address) (*recomp_memory_u16((uint32_t)(address)))
 #define MEM8(address) \

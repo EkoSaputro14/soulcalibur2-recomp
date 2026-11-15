@@ -49,7 +49,7 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va);
 #define esi recomp_runtime.registers.esi
 #define edi recomp_runtime.registers.edi
 #define esp recomp_runtime.registers.esp
-#define g_esp recomp_runtime.registers.esp
+#define g_esp (*recomp_esp_register_inline())
 #define g_seh_ebp recomp_runtime.registers.ebp
 /* The lifter publishes the established frame as g_ebp and re-publishes it
    before calls; g_seh_ebp is the same guest EBP the SEH helper path reads.
