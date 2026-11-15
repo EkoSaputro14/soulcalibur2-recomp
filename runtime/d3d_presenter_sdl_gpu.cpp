@@ -31,6 +31,8 @@
 #include <unistd.h>
 #ifdef __ANDROID__
 #include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #endif
 
 #include <algorithm>
@@ -409,6 +411,7 @@ struct RecompD3dPresenter {
     std::unordered_set<uint64_t> saved_pipeline_hashes;
     std::thread precompile;
     std::atomic<bool> precompile_stop{false};
+    std::atomic<int> foreground_shader_compiles{0};
 
     std::vector<TextureEntry> textures = std::vector<TextureEntry>(kTextureSlots);
     bool texture_used[kTextureSlots]{};
@@ -1400,6 +1403,24 @@ SDL_GPUShader *createShader(RecompD3dPresenter *presenter, const std::string &hl
     return shader;
 }
 
+struct ForegroundCompileGuard {
+    std::atomic<int> *counter = nullptr;
+    explicit ForegroundCompileGuard(std::atomic<int> *c) : counter(c) {
+        if (counter != nullptr) counter->fetch_add(1, std::memory_order_release);
+    }
+    ~ForegroundCompileGuard() {
+        if (counter != nullptr) counter->fetch_sub(1, std::memory_order_release);
+    }
+};
+
+void pauseForForegroundCompile(RecompD3dPresenter *presenter)
+{
+    while (!presenter->precompile_stop.load(std::memory_order_relaxed) &&
+           presenter->foreground_shader_compiles.load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 /* The draw shader for one key. A count-pass variant outputs one per fragment
    that survives its discards, for occlusion counting. Failures are cached
    too, so a shader that cannot build is not retried every draw. */
@@ -1440,6 +1461,7 @@ ShaderPair lookupShaders(RecompD3dPresenter *presenter, const RecompD3dDrawShade
             return found->second;
         }
     }
+    ForegroundCompileGuard fg_guard(on_owner ? &presenter->foreground_shader_compiles : nullptr);
     const auto start = std::chrono::steady_clock::now();
     ShaderPair pair;
     std::string hlsl;
@@ -1485,8 +1507,9 @@ void precompileSavedPipelines(RecompD3dPresenter *presenter);
 void precompileDrawShaders(RecompD3dPresenter *presenter)
 {
 #ifdef __ANDROID__
-    // Allow background shader/pipeline warmup to schedule across all online cores so it
-    // does not contend with the main game thread on the performance cluster.
+    // Lower background precompile priority and allow it to run across all cores so
+    // it never steals CPU budget or scheduler slots from the foreground game thread.
+    setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 10);
     const int cpu_count = static_cast<int>(sysconf(_SC_NPROCESSORS_CONF));
     if (cpu_count > 0) {
         cpu_set_t all_cpus;
@@ -1535,6 +1558,7 @@ void precompileDrawShaders(RecompD3dPresenter *presenter)
 
     static constexpr uint32_t kSc2CommonFixedFvfs[] = {0x042u, 0x044u, 0x104u, 0x142u, 0x144u, 0x152u};
     for (const uint32_t fvf : kSc2CommonFixedFvfs) {
+        pauseForForegroundCompile(presenter);
         if (presenter->precompile_stop.load()) return;
         const bool has_uv = (fvf & 0xf00u) != 0u;
         const RecompD3dDrawShaderKey key{
@@ -1545,12 +1569,14 @@ void precompileDrawShaders(RecompD3dPresenter *presenter)
     }
 
     for (const uint32_t fvf : kRecompD3dBootDrawFvfs) {
+        pauseForForegroundCompile(presenter);
         if (presenter->precompile_stop.load()) return;
         const RecompD3dDrawShaderKey key{fvf, 0u, nullptr, false, false, false};
         compiled += lookupShaders(presenter, key, false).vertex != nullptr;
     }
     static constexpr uint32_t kSc2ExtraBootFvfs[] = {0x152u, 0x158u};
     for (const uint32_t fvf : kSc2ExtraBootFvfs) {
+        pauseForForegroundCompile(presenter);
         if (presenter->precompile_stop.load()) return;
         const RecompD3dDrawShaderKey key{fvf, 0u, nullptr, false, false, false};
         compiled += lookupShaders(presenter, key, false).vertex != nullptr;
@@ -1906,6 +1932,8 @@ void precompileSavedPipelines(RecompD3dPresenter *presenter)
             hdr.sample_depth_bias != 0u,
             hdr.has_pixel ? &pixel : nullptr
         };
+        pauseForForegroundCompile(presenter);
+        if (presenter->precompile_stop.load()) break;
         const ShaderPair shaders = lookupShaders(presenter, skey, hdr.count_pass != 0u);
         if (shaders.vertex == nullptr || shaders.fragment == nullptr) continue;
 
@@ -1943,6 +1971,8 @@ void precompileSavedPipelines(RecompD3dPresenter *presenter)
             std::lock_guard<std::mutex> lock(presenter->pipeline_lock);
             if (presenter->pipelines.find(pkey) != presenter->pipelines.end()) continue;
         }
+        pauseForForegroundCompile(presenter);
+        if (presenter->precompile_stop.load()) break;
         SDL_GPUGraphicsPipeline *pipeline = buildGraphicsPipeline(presenter, pkey, shaders.layout);
         std::lock_guard<std::mutex> lock(presenter->pipeline_lock);
         const auto inserted = presenter->pipelines.emplace(pkey, pipeline);
@@ -2026,6 +2056,7 @@ SDL_GPUGraphicsPipeline *lookupPipeline(RecompD3dPresenter *presenter, const Pip
         }
     }
 
+    ForegroundCompileGuard fg_guard(on_owner ? &presenter->foreground_shader_compiles : nullptr);
     const auto start = std::chrono::steady_clock::now();
     SDL_GPUGraphicsPipeline *pipeline = buildGraphicsPipeline(presenter, key, state.shaders.layout);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2383,17 +2414,32 @@ void queueDraw(RecompD3dPresenter *presenter, SDL_GPUGraphicsPipeline *pipeline,
     queued.index_offset = appendAligned(segment.index_data, indices, index_count * sizeof(uint16_t));
     queued.index_count = index_count;
     /* The Transform buffer is the draw constants without vc[], which goes to
-       the vertex stage's second buffer; consecutive draws often repeat both. */
+       the vertex stage's second buffer; recent draws often alternate between a
+       small set of transform/material constant blocks. */
     std::vector<float> &uniforms = segment.uniform_data;
     const float *tail_src = constants + 140u + kProgramFloats;
     const size_t head_bytes = 140u * sizeof(float);
     const size_t tail_floats = kTransformFloats - 140u;
     const size_t tail_bytes = tail_floats * sizeof(float);
-    if (!segment.draws.empty() && segment.draws.back().uniform_offset + kTransformFloats <= uniforms.size() &&
-        std::memcmp(uniforms.data() + segment.draws.back().uniform_offset, constants, head_bytes) == 0 &&
-        std::memcmp(uniforms.data() + segment.draws.back().uniform_offset + 140u, tail_src, tail_bytes) == 0) {
-        queued.uniform_offset = segment.draws.back().uniform_offset;
-    } else {
+    queued.uniform_offset = UINT32_MAX;
+    const size_t check_count = std::min<size_t>(segment.draws.size(), 4u);
+    for (size_t back_idx = 0u; back_idx < check_count; ++back_idx) {
+        const uint32_t candidate_offset = segment.draws[segment.draws.size() - 1u - back_idx].uniform_offset;
+        bool already_checked = false;
+        for (size_t prev = 0u; prev < back_idx; ++prev) {
+            if (segment.draws[segment.draws.size() - 1u - prev].uniform_offset == candidate_offset) {
+                already_checked = true;
+                break;
+            }
+        }
+        if (already_checked || candidate_offset + kTransformFloats > uniforms.size()) continue;
+        if (std::memcmp(uniforms.data() + candidate_offset, constants, head_bytes) == 0 &&
+            std::memcmp(uniforms.data() + candidate_offset + 140u, tail_src, tail_bytes) == 0) {
+            queued.uniform_offset = candidate_offset;
+            break;
+        }
+    }
+    if (queued.uniform_offset == UINT32_MAX) {
         queued.uniform_offset = static_cast<uint32_t>(uniforms.size());
         uniforms.resize(queued.uniform_offset + kTransformFloats);
         std::memcpy(uniforms.data() + queued.uniform_offset, constants, head_bytes);
@@ -2401,11 +2447,23 @@ void queueDraw(RecompD3dPresenter *presenter, SDL_GPUGraphicsPipeline *pipeline,
     }
     if (program) {
         const float *vc = constants + 140u;
-        if (!segment.draws.empty() && segment.draws.back().program_offset != UINT32_MAX &&
-            std::memcmp(uniforms.data() + segment.draws.back().program_offset, vc,
-                kProgramFloats * sizeof(float)) == 0) {
-            queued.program_offset = segment.draws.back().program_offset;
-        } else {
+        for (size_t back_idx = 0u; back_idx < check_count; ++back_idx) {
+            const uint32_t candidate_offset = segment.draws[segment.draws.size() - 1u - back_idx].program_offset;
+            if (candidate_offset == UINT32_MAX || candidate_offset + kProgramFloats > uniforms.size()) continue;
+            bool already_checked = false;
+            for (size_t prev = 0u; prev < back_idx; ++prev) {
+                if (segment.draws[segment.draws.size() - 1u - prev].program_offset == candidate_offset) {
+                    already_checked = true;
+                    break;
+                }
+            }
+            if (already_checked) continue;
+            if (std::memcmp(uniforms.data() + candidate_offset, vc, kProgramFloats * sizeof(float)) == 0) {
+                queued.program_offset = candidate_offset;
+                break;
+            }
+        }
+        if (queued.program_offset == UINT32_MAX) {
             queued.program_offset = static_cast<uint32_t>(uniforms.size());
             uniforms.insert(uniforms.end(), vc, vc + kProgramFloats);
         }
@@ -3951,9 +4009,10 @@ RecompD3dPresenterError d3d_backend_create(const RecompD3dPresenterConfig *confi
         ? SDL_GPU_PRESENTMODE_MAILBOX : SDL_GPU_PRESENTMODE_VSYNC;
     SDL_SetGPUSwapchainParameters(created->device, created->window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, present_mode);
     if (!createResources(created)) return fail("presenter resources");
-    std::fprintf(stderr, "recomp d3d presenter: %s target=%ux%u msaa=%u window=%ux%u\n",
+    std::fprintf(stderr, "recomp d3d presenter: %s target=%ux%u msaa=%u window=%ux%u present_mode=%s\n",
         SDL_GetGPUDeviceDriver(created->device), main_width, main_height, created->msaa_count,
-        window_width, window_height);
+        window_width, window_height,
+        present_mode == SDL_GPU_PRESENTMODE_MAILBOX ? "mailbox" : "vsync");
     try {
         created->precompile = std::thread(precompileDrawShaders, created);
     } catch (const std::system_error &) {

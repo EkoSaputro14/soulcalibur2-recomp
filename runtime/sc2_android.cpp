@@ -6,6 +6,7 @@
 // system's log (adb logcat -s soulcalibur2). Taken from cps2recomp's port/android.cpp.
 #ifdef __ANDROID__
 #include "sc2_android.h"
+#include "sc2_android_telemetry.h"
 #include "sc2_cpu_affinity.h"
 #include "sc2_perf_metrics.h"
 #include "sc2_settings.h"
@@ -100,28 +101,92 @@ static void crashed(int signal, siginfo_t *info, void *)
     raise(signal);
 }
 
-// The cores' speed caps now (a warm phone lowers them), for the speed line
-static std::string coreCaps()
+static long readSysfsLong(const char *path)
 {
-    std::string caps;
+    long value = 0;
+    if (std::FILE *file = std::fopen(path, "r")) {
+        if (std::fscanf(file, "%ld", &value) != 1) value = 0;
+        std::fclose(file);
+    }
+    return value;
+}
+
+static std::vector<sc2::ClusterFreqSample> readClusterFreqs()
+{
+    std::vector<sc2::ClusterFreqSample> samples;
     const int count = static_cast<int>(sysconf(_SC_NPROCESSORS_CONF));
-    if (count <= 0) return "unknown";
-    long previous = -1;
+    if (count <= 0) return samples;
+    long previous_max = -1;
+    long previous_cur = -1;
     for (int cpu = 0; cpu < count; ++cpu) {
         char path[96];
         std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", cpu);
-        long cap = 0;
-        if (std::FILE *file = std::fopen(path, "r")) {
-            if (std::fscanf(file, "%ld", &cap) != 1) cap = 0;
-            std::fclose(file);
+        const long max_khz = readSysfsLong(path);
+        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
+        const long cur_khz = readSysfsLong(path);
+        if (max_khz > 0) {
+            if (max_khz == previous_max) continue;
+            previous_max = max_khz;
+        } else if (cur_khz <= 0 || cur_khz == previous_cur) {
+            continue;
         }
-        if (cap == previous) continue; // (a cluster's cores share one)
-        previous = cap;
-        char one[32];
-        std::snprintf(one, sizeof one, "%scpu%d %.2f", caps.empty() ? "" : ", ", cpu, cap / 1e6);
-        caps += one;
+        previous_cur = cur_khz;
+        samples.push_back({cpu, max_khz, cur_khz});
     }
-    return caps + " GHz";
+    return samples;
+}
+
+// The cores' speed caps now (a warm phone lowers them), for the speed line
+static std::string coreCaps()
+{
+    return sc2::FormatClusterCaps(readClusterFreqs());
+}
+
+static std::string readThermalStatus()
+{
+    std::vector<sc2::ThermalZoneSample> zones;
+    for (int i = 0; i < 64; ++i) {
+        char temp_path[96];
+        std::snprintf(temp_path, sizeof temp_path, "/sys/class/thermal/thermal_zone%d/temp", i);
+        std::FILE *temp_file = std::fopen(temp_path, "r");
+        if (temp_file == nullptr) continue;
+        long raw = 0;
+        const int scanned = std::fscanf(temp_file, "%ld", &raw);
+        std::fclose(temp_file);
+        if (scanned != 1) continue;
+        double celsius = 0.0;
+        if (!sc2::ParseThermalTempCelsius(raw, celsius)) continue;
+
+        sc2::ThermalZoneSample sample;
+        sample.temp_c = celsius;
+        sample.valid = true;
+
+        char type_path[96];
+        std::snprintf(type_path, sizeof type_path, "/sys/class/thermal/thermal_zone%d/type", i);
+        if (std::FILE *type_file = std::fopen(type_path, "r")) {
+            char buf[64]{};
+            if (std::fgets(buf, sizeof buf, type_file) != nullptr) {
+                const size_t len = std::strlen(buf);
+                size_t trimmed = len;
+                while (trimmed > 0 && (buf[trimmed - 1] == '\n' || buf[trimmed - 1] == '\r' ||
+                                       buf[trimmed - 1] == ' ' || buf[trimmed - 1] == '\t')) {
+                    --trimmed;
+                }
+                sample.type.assign(buf, trimmed);
+            }
+            std::fclose(type_file);
+        }
+        zones.push_back(sample);
+    }
+    sc2::ThermalZoneSample best;
+    if (!sc2::SelectBestThermalZone(zones, best)) return "n/a";
+    char out[96];
+    if (best.type.empty()) {
+        std::snprintf(out, sizeof out, "%.1fC", best.temp_c);
+    } else {
+        std::snprintf(out, sizeof out, "%.1fC(%s)", best.temp_c, best.type.c_str());
+    }
+    return out;
 }
 
 // Select active CPU cores dynamically using effective speeds (min(cpuinfo_max_freq, scaling_max_freq)).
@@ -351,12 +416,17 @@ extern "C" void sc2_android_frame(void)
         const double pres_ms = (perf.present_total_ns / 1e6) / denom;
         const double wait_ms = (perf.present_wait_ns / 1e6) / denom;
         const double guest_ms = std::max(0.0, frame_ms - (prep_ms + draw_ms + upload_ms + flush_ms + pres_ms));
+        const std::vector<sc2::ClusterFreqSample> freqs = readClusterFreqs();
+        const std::string caps_str = sc2::FormatClusterCaps(freqs);
+        const std::string cur_str = sc2::FormatClusterCur(freqs);
+        const int active_cpu = sched_getcpu();
+        const std::string temp_str = readThermalStatus();
         std::fprintf(stderr,
             "soulcalibur2 speed: %.1f frames a second, longest frame %.1f ms, sound gaps %llu "
-            "(caps %s) | guest=%.2f prep=%.2f draw=%.2f upload=%.2f dec=%.2f flush=%.2f pres=%.2f wait=%.2f vblank=%.2f ms/f "
+            "(caps %s | cur %s | cpu=%d | temp=%s) | guest=%.2f prep=%.2f draw=%.2f upload=%.2f dec=%.2f flush=%.2f pres=%.2f wait=%.2f vblank=%.2f ms/f "
             "max(d=%.1f f=%.1f p=%.1f ms) (d=%u u=%u dec=%u f=%u)\n",
             frames * 1000.0 / elapsed_ms, longest / 1e6, gaps - gaps_before,
-            coreCaps().c_str(),
+            caps_str.c_str(), cur_str.c_str(), active_cpu, temp_str.c_str(),
             guest_ms, prep_ms, draw_ms, upload_ms, decode_ms, flush_ms, pres_ms, wait_ms,
             vblank_ms / denom,
             perf.max_frame_draw_ns / 1e6,

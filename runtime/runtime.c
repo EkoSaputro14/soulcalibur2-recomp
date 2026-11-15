@@ -82,8 +82,11 @@ typedef struct RecompDispatchSlot {
     RecompFunction function;
 } RecompDispatchSlot;
 
-enum { RECOMP_DISPATCH_CACHE_SIZE = 2048u };
-static RecompDispatchSlot dispatch_cache[RECOMP_DISPATCH_CACHE_SIZE];
+enum { RECOMP_DISPATCH_CACHE_SETS = 2048u };
+typedef struct RecompDispatchSet {
+    RecompDispatchSlot ways[2];
+} RecompDispatchSet;
+static RecompDispatchSet dispatch_cache[RECOMP_DISPATCH_CACHE_SETS];
 static RecompDispatchSlot *dispatch_hash_table;
 static size_t dispatch_hash_mask;
 static const RecompFunctionEntry *dispatch_hash_source;
@@ -797,10 +800,19 @@ uint32_t *recomp_esp_register(void)
 
 bool recomp_dispatch(uint32_t guest_address)
 {
-    const uint32_t cache_idx = ((guest_address >> 2) ^ (guest_address >> 13)) & (RECOMP_DISPATCH_CACHE_SIZE - 1u);
-    if (dispatch_cache[cache_idx].address == guest_address && dispatch_cache[cache_idx].function != NULL) {
+    const uint32_t set_idx = ((guest_address >> 2) ^ (guest_address >> 13)) & (RECOMP_DISPATCH_CACHE_SETS - 1u);
+    RecompDispatchSet *set = &dispatch_cache[set_idx];
+    if (RECOMP_LIKELY(set->ways[0].address == guest_address && set->ways[0].function != NULL)) {
         recomp_last_dispatch_address = guest_address;
-        dispatch_cache[cache_idx].function();
+        set->ways[0].function();
+        return true;
+    }
+    if (RECOMP_LIKELY(set->ways[1].address == guest_address && set->ways[1].function != NULL)) {
+        const RecompDispatchSlot hit = set->ways[1];
+        set->ways[1] = set->ways[0];
+        set->ways[0] = hit;
+        recomp_last_dispatch_address = guest_address;
+        hit.function();
         return true;
     }
 
@@ -835,8 +847,9 @@ bool recomp_dispatch(uint32_t guest_address)
     }
 
     if (resolved != NULL) {
-        dispatch_cache[cache_idx].address = guest_address;
-        dispatch_cache[cache_idx].function = resolved;
+        set->ways[1] = set->ways[0];
+        set->ways[0].address = guest_address;
+        set->ways[0].function = resolved;
         recomp_last_dispatch_address = guest_address;
         resolved();
         return true;

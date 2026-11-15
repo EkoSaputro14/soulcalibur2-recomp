@@ -11,6 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define recomp_guest_load recomp_guest_load_inline
+#define recomp_guest_store recomp_guest_store_inline
+#define recomp_guest_memcpy recomp_guest_memcpy_inline
+#define recomp_guest_memset recomp_guest_memset_inline
+
 enum {
     D3D_DIRTY = 0x0015e188u,
     D3D_RENDER_STATE = 0x0015e390u,

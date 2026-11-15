@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "sc2_android_telemetry.h"
 #include "sc2_cpu_affinity.h"
 #include "sc2_dxt_decode.h"
 #include "sc2_texture_cache.h"
@@ -272,6 +273,37 @@ void testTextureCachePolicy()
     CHECK(cursor == 3u);
 }
 
+void testAndroidTelemetry()
+{
+    double celsius = 0.0;
+    CHECK(!sc2::ParseThermalTempCelsius(-273000, celsius));
+    CHECK(!sc2::ParseThermalTempCelsius(0, celsius));
+    CHECK(sc2::ParseThermalTempCelsius(48500, celsius) && celsius > 48.4 && celsius < 48.6);
+    CHECK(sc2::ParseThermalTempCelsius(372, celsius) && celsius > 37.1 && celsius < 37.3);
+    CHECK(sc2::ParseThermalTempCelsius(54, celsius) && celsius > 53.9 && celsius < 54.1);
+    CHECK(!sc2::ParseThermalTempCelsius(150000, celsius));
+
+    sc2::ThermalZoneSample best;
+    CHECK(!sc2::SelectBestThermalZone({{"battery", 34.0, false}}, best));
+    CHECK(sc2::SelectBestThermalZone({
+        {"battery", 36.5, true},
+        {"tsens_tz_sensor4", 58.2, true},
+        {"cpu-0-0", 63.4, true},
+        {"gpu-usr", 71.0, true},
+    }, best));
+    CHECK(best.type == "cpu-0-0");
+    CHECK(best.temp_c > 63.3 && best.temp_c < 63.5);
+
+    const std::vector<sc2::ClusterFreqSample> freqs = {
+        {0, 1380000, 940000},
+        {4, 1400000, 1400000},
+        {7, 2020000, 2020000},
+    };
+    CHECK(sc2::FormatClusterCaps(freqs) == "cpu0 1.38, cpu4 1.40, cpu7 2.02 GHz");
+    CHECK(sc2::FormatClusterCur(freqs) == "cpu0 0.94, cpu4 1.40, cpu7 2.02 GHz");
+    CHECK(sc2::FormatClusterCur({{0, 1380000, 0}, {4, 1400000, 0}}) == "n/a");
+}
+
 } // namespace
 
 int main()
@@ -280,6 +312,7 @@ int main()
     testDxtDecodeExact();
     testTextureUnswizzleExact();
     testTextureCachePolicy();
+    testAndroidTelemetry();
     if (g_failures != 0) {
         std::fprintf(stderr, "sc2_perf_test: %d checks failed\n", g_failures);
         return 1;

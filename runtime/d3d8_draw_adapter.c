@@ -25,6 +25,11 @@
 #include <time.h>
 #endif
 
+#define recomp_guest_load recomp_guest_load_inline
+#define recomp_guest_store recomp_guest_store_inline
+#define recomp_guest_memcpy recomp_guest_memcpy_inline
+#define recomp_guest_memset recomp_guest_memset_inline
+
 static uint64_t draw_prep_accum_ns;
 
 static inline uint64_t draw_prep_now_ns(void)
